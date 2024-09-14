@@ -1,0 +1,486 @@
+---
+title: "Bulk_CTSN_J.Hsu"
+author: "Francis Leblanc"
+date: '2022-10-13'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+
+library(tximport)
+library(DESeq2)
+library(rio)
+library(limma)
+library(factoextra)
+library(Seurat)
+library(ggrepel)
+library(ggpubr)
+library(data.table)
+library(patchwork)
+library(stringr)
+library(cowplot)
+library(biomaRt)
+library(dplyr)
+
+custom.f <- scale_fill_manual(values = c("#b80909","darkblue"))
+theme_set(theme_cowplot())
+```
+
+# Bulk CTSN
+## import CTSN data
+
+```{r}
+# counts
+meta_ctsn <- rio::import("data/input/meta.ctsn.tsv") %>%
+  rename(sex = SEX) %>% 
+  mutate(condition = gsub("SR", "Ctl", condition)) %>% 
+  mutate(path = paste0("data/input/kallisto_quant/stranded/",
+                       sample,
+                       "_/abundance.h5"))
+
+tx2gene <- rio::import("data/output/tx2gene.gencode.v32.tsv.gz")
+tx2gene$stable_GENEID <- str_split(tx2gene$GENEID, "[.]", simplify = T)[,1]
+
+txi_kallisto <- tximport(meta_ctsn$path,
+                         type = "kallisto",
+                         tx2gene = tx2gene[, 1:2],
+                         ignoreAfterBar = TRUE)
+
+dds <- DESeqDataSetFromTximport(txi_kallisto,
+                                meta_ctsn,
+                                design = ~ sex + condition)
+
+# the published matrix:
+# counts(dds) == http://www.mhi-humangenetics.org/dataset/meta.ctsn.tsv
+```
+
+## PCA 
+
+```{r}
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+vst <- vst(dds, blind = T)
+
+# plot PCA, loadings and mesothelial markers showing contribution to variance
+plot_pca_itln1 <- function(vst_obj = vst, 
+                           meta_data = meta_ctsn,
+                           gene_id = "ENSG00000179914.5",
+                           gene_name_col = "GENEID") {
+  vst.mat <- assay(vst_obj)
+  
+  rv <- rowVars(assay(vst_obj))
+  select <- order(rv, decreasing = TRUE)[seq_len(500)]
+  
+  pca <- prcomp(t(assay(vst_obj)[select, ]))
+  
+  # Get pca positions of individuals
+  ind <- get_pca_ind(pca)
+  df_ind <- data.frame(ind$coord[, 1:2]) %>% 
+    mutate(sample = meta_data$sample, sex = meta_data$sex)
+  
+  # Plot
+  p0 <- ggplot(df_ind, aes(Dim.1, Dim.2, fill = sex)) +
+    geom_point(shape = 21, size = 3) +
+    custom.f +
+    xlab("PC1") + 
+    ylab("PC2") 
+  
+  # PC1 associated with mesothelial cells
+  var <- get_pca_var(pca)
+  cont <- as.data.frame(var[["contrib"]][, 1])
+  cont$gene_name <- tx2gene$SYMB[
+    match(row.names(cont), tx2gene[, gene_name_col])
+    ]
+  colnames(cont)[1] <- "PC1_loading"
+  cont <- cont %>%
+    arrange(desc(PC1_loading)) %>%
+    slice_max(PC1_loading, n = 10) %>%
+    mutate(gene_name = factor(gene_name, levels = gene_name))
+  
+  # Get gene expression by sample for ITLN1 (strongest loading PC1)
+  df_ind$ITLN1 <- vst.mat[gene_id, ]
+  
+  # Plot gene expression against PC1 coordinates (Top left panel)
+  ITLN1.x <- ggplot(df_ind, aes(Dim.1, ITLN1, fill = sex)) +
+    geom_point(shape = 21, size = 3) +
+    custom.f +
+    theme(legend.position = "none") +
+    xlab("PC1") +
+    ylab("ITLN1 log2 exp")
+  
+  p.load <- ggplot(cont, aes(x = PC1_loading, y = gene_name)) +
+    geom_col()
+  
+  # dotplot top loading genes in single cell
+  dp <- DotPlot(scAF, 
+                assay = "RNA", 
+                features = cont$gene_name, 
+                group.by = "WNN.sub.ct",
+                dot.min = 0.1) + 
+    scale_colour_viridis_c() +
+    xlab(NULL) +
+    ylab(NULL) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) 
+  
+  p0 / ITLN1.x / p.load / dp
+}
+
+plot_pca_itln1()
+ggsave("figs/bulk_qc_deg/PCA_CTSN.png", width = 7, height = 16)
+```
+
+## DEG CTSN
+### Stranded
+
+```{r}
+dds$condition <- relevel(dds$condition, ref = "Ctl")
+
+# remove low count genes
+min_counts <- rowSums(counts(dds)) >= 10
+dds <- dds[min_counts,]
+
+dds_cond <- DESeq(dds)
+res_standed <- lfcShrink(dds_cond, coef = "condition_AF_vs_Ctl") %>%
+  as.data.frame()
+```
+
+### Unstranded
+
+```{r}
+meta_ctsn_unst <- rio::import("data/input/meta.ctsn.tsv") %>%
+  rename(sex = SEX) %>% 
+  mutate(condition = gsub("SR", "Ctl", condition)) %>%
+  mutate(path = paste0("data/input/kallisto_quant/unstranded/",
+                        sample,
+                        "_/abundance.h5"))
+
+txi_kallisto_g <- tximport(meta_ctsn_unst$path, 
+                           type = "kallisto", 
+                           tx2gene = tx2gene[,1:2], 
+                           ignoreAfterBar = TRUE)
+
+dds_unstr <- DESeqDataSetFromTximport(txi_kallisto_g, 
+                                      meta_ctsn_unst, 
+                                      design = ~ sex + condition)
+dds_unstr$condition <- relevel(dds_unstr$condition, ref = "Ctl")
+
+# remove low count genes
+min_counts <- rowSums(counts(dds_unstr)) >= 10
+dds_unstr <- dds_unstr[min_counts,]
+
+dds_cond <- DESeq(dds_unstr)
+res_unstanded <- lfcShrink(dds_cond, coef = "condition_AF_vs_Ctl") %>%
+  as.data.frame()
+```
+
+# Bulk J.Hsu
+## import J.Hsu data
+
+```{r}
+# count data
+pheno_jhsu <- readRDS("data/output/pheno_J.Hsu.rds")
+
+# Load and prepare gene expression counts
+expression_data <- read.csv(
+  "data/input/GSE69890/GSM1712025_raw_counts.txt",
+  row.names = 1
+) %>%
+  dplyr::select(rownames(pheno_jhsu))
+
+# Prepare metadata
+pheno_jhsu <- pheno_jhsu %>%
+  mutate(sample = rownames(.)) %>%
+  dplyr::select(sample, sexFemale, AtrialRhythm) %>%
+  rename(sex = sexFemale, rhythm = AtrialRhythm) %>%
+  # There was an inversion in the original data labeling for sex 
+  # sexFemale had values 'F' for male (verified with XIST expression)
+  mutate(sex = recode(sex, 'F' = "Male", 'M' = "Female"), dataset = "J.Hsu")
+
+dds_jhsu <- DESeqDataSetFromMatrix(countData = expression_data,
+                                   colData = pheno_jhsu,
+                                   design = ~ sex + rhythm)
+```
+
+## PCA 
+
+```{r}
+vst_jhsu <- vst(dds_jhsu, blind=T)
+
+plot_pca_itln1(vst_obj = vst_jhsu, 
+               meta_data = pheno_jhsu,
+               gene_id = "ENSG00000179914",
+               gene_name_col = "stable_GENEID")
+
+ggsave("figs/bulk_qc_deg/PCA_J-hsu.png", width = 7, height = 16)
+```
+
+## DEG J.Hsu 
+
+```{r}
+dds_jhsu$rhythm <- relevel(dds_jhsu$rhythm, ref = "CTL")
+
+# remove low count genes
+min_counts <- rowSums(counts(dds_jhsu)) >= 10
+dds_jhsu <- dds_jhsu[min_counts,] 
+
+dds_jhsu <- DESeq(dds_jhsu)
+res_jhsu <- lfcShrink(dds_jhsu, coef="rhythm_AF_vs_CTL") %>% 
+  as.data.frame()
+```
+
+# bulk DEG 
+## merge results
+
+```{r}
+colnames(res_unstanded) <- paste0("CTSN.Unstranded_", colnames(res_unstanded))
+colnames(res_standed) <- paste0("CTSN.Stranded_", colnames(res_standed))
+colnames(res_jhsu) <- paste0("J.Hsu_", colnames(res_jhsu))
+
+res_unstanded$GENEID <- str_split(row.names(res_unstanded), 
+                                  "[.]", 
+                                  simplify = T)[,1]
+res_standed$GENEID <- str_split(row.names(res_standed), 
+                                "[.]", 
+                                simplify = T)[,1]
+res_jhsu$GENEID <- row.names(res_jhsu)
+
+bulk_DEGs <- list(res_unstanded[,-3],
+                  res_standed[,-3], 
+                  res_jhsu[,-3]) %>% 
+  purrr::reduce(full_join, by='GENEID')
+
+colnames(bulk_DEGs) <- gsub("log2FoldChange", "L2FC", colnames(bulk_DEGs))
+
+bulk_DEGs$gene_name <- tx2gene$SYMB[
+  match(bulk_DEGs$GENEID, tx2gene$stable_GENEID)
+  ]
+```
+
+## adding other gene information
+
+```{r}
+ensembl_hsa <- useMart(biomart = "ensembl",
+                       dataset = "hsapiens_gene_ensembl")
+att_keep <- c("ensembl_gene_id",
+              "external_gene_name",
+              "chromosome_name",
+              "strand",
+              "start_position",
+              "end_position",
+              "gene_biotype",
+              "description")
+
+genes_meta <- getBM(attributes = att_keep,
+                    filters = "ensembl_gene_id",
+                    values = bulk_DEGs$GENEID,
+                    ensembl_hsa)
+
+bulk_DEGs[, c(att_keep)] <- genes_meta[match(
+  bulk_DEGs$GENEID, genes_meta$ensembl_gene_id
+), ]
+
+# which CTSN DEG change with strandedness
+bulk_DEGs$CTSN.Stranded_padj[is.na(bulk_DEGs$CTSN.Stranded_padj)] <- 1
+
+bulk_DEGs <- bulk_DEGs %>% 
+  mutate(Stranded_dependent = (CTSN.Unstranded_padj < 0.05 & 
+                                 CTSN.Stranded_padj > 0.05))
+
+rio::export(bulk_DEGs, "results/bulk_DEGs.csv") 
+```
+
+### CTSN volcano plot
+
+```{r}
+keep <- c("RNF216",
+          "LINC01479",
+          "IFNG-AS1",
+          "SLC27A6",
+          "HNRNPA1P70",
+          "C4orf54",
+          "COLQ",
+          "REC114",
+          "HCN4",
+          "RCAN1",
+          "CYP26B1",
+          "RGS6",
+          "TRDN-AS1")
+
+bulk_DEGs <- bulk_DEGs %>% 
+  mutate(labels = ifelse(gene_name %in% keep, gene_name, NA),
+         DEG = CTSN.Stranded_padj < 0.05 & abs(CTSN.Stranded_L2FC) > 0.25)
+
+ggplot(bulk_DEGs, 
+       aes(x = CTSN.Stranded_L2FC,
+           y = -log10(CTSN.Stranded_padj), 
+           label = labels, 
+           color = DEG)) +
+  geom_point(size = .7, alpha = .7) +
+  geom_label_repel(color = "black",
+                   min.segment.length = 0.01, 
+                   max.overlaps = 30,
+                   alpha = 0.7, 
+                   box.padding = 0.5) +
+  scale_color_manual(values = c("black", "darkred")) +
+  theme(legend.position = c(.2,.7))+
+  annotate(geom = "label", 
+           label=expression("" %up% "AF"), 
+           x = 2, 
+           y = 60, 
+           fill = "lightgrey") +
+  annotate(geom = "label", 
+           label=expression("" %up% "SR"),
+           x = -2, 
+           y = 60, 
+           fill = "lightgrey") +
+  ylim(0, 60) + 
+  ylab("-Log10(FDR)") +
+  xlab("Log2 fold change") +
+  ggtitle(NULL)
+
+ggsave("figs/bulk_qc_deg/volcano_CTSN.png", height = 6, width = 5.2)
+```
+
+## plot -log10 FDR between CTSN and J. Hsu
+
+```{r}
+bulk_DEGs %>% 
+  mutate(signed_CTSN = (-log10(CTSN.Stranded_padj) * sign(CTSN.Stranded_L2FC)),
+         signed_J.Hsu = (-log10(J.Hsu_padj) * sign(J.Hsu_L2FC)),
+         sign_both = ifelse(
+           CTSN.Stranded_padj < 0.05 & J.Hsu_padj < 0.05, T, F
+           )) %>% 
+  mutate(sign_both = ifelse(is.na(sign_both), F, sign_both)) %>% 
+  ggscatter(x="signed_CTSN", 
+            y="signed_J.Hsu", 
+            color="sign_both",
+            size = 0.2,
+            cor.coef = T, 
+            cor.method = "spearman", 
+            add = "reg.line", 
+            add.params = list(color="black")) + 
+  scale_color_manual(values = c("black", "darkred")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(color = "DEG significant in both") +
+  ylab("GSE69890 signed log10(FDR)") + 
+  xlab("CTSN signed log10(FDR)") +
+  annotate(x = 20,
+           y = 40,
+           geom = "text",
+           label = "DEG in both with same direction\n n = 755") +
+  annotate(x = 20,
+           y = -30,
+           geom = "text",
+           label = "DEG in both with different direction\n n = 45")
+
+ggsave("figs/bulk_qc_deg/scatter_bulk_DEG_comparison.png", 
+       width = 6, 
+       height = 6)
+```
+
+# Meta-analysis of CTSN and J. Hsu
+## merge matrices
+
+```{r}
+dds <- DESeqDataSetFromTximport(txi_kallisto, 
+                                meta_ctsn, 
+                                design = ~ sex + condition)
+dds_jhsu <- DESeqDataSetFromMatrix(countData = expression_data,
+                                   colData = pheno_jhsu,
+                                   design = ~ sex + rhythm)
+
+# CTSN has versioned GENEIDs
+row.names(dds) <- row.names(dds) %>%
+  limma::strsplit2("[.]") %>%
+  .[, 1]
+
+# tidy meta data
+colData(dds)$dataset <- "CTSN"
+colData(dds)$rhythm <- colData(dds)$condition
+cols_keep <- c("sample", "sex", "dataset", "rhythm")
+colData(dds) <- colData(dds)[, cols_keep]
+colData(dds_jhsu) <- colData(dds_jhsu)[, cols_keep]
+meta_combined <- rbind(colData(dds)[,cols_keep], colData(dds_jhsu)[, cols_keep])
+row.names(meta_combined) <- meta_combined$sample
+
+# keep common genes
+keep <- intersect(row.names(dds) , row.names(dds_jhsu))
+counts_combined <- cbind(counts(dds)[keep, ], counts(dds_jhsu)[keep, ])
+colnames(counts_combined) <- NULL
+
+
+dds_combined <- DESeqDataSetFromMatrix(countData = counts_combined,
+                                       colData = meta_combined,
+                                       design = ~ sex + rhythm)
+
+dds_combined <- estimateSizeFactors(dds_combined)
+norm_counts <- counts(dds_combined, normalized = TRUE)
+vst_combined <- vst(dds_combined, blind = T)
+
+# samples cluster by sex and dataset; removing these effects
+assay(vst_combined) <- limma::removeBatchEffect(assay(vst_combined), 
+                                                batch = vst_combined$sex, 
+                                                batch2 = vst_combined$dataset)
+```
+
+## format expr matrix from batch corrected VST 
+
+```{r}
+# fix gene names (NA and duplicates)
+expr <- assay(vst_combined)
+
+add_gene_names <- function(m = expr) {
+  ens_names <- row.names(m)
+  gene_names <- bulk_DEGs$external_gene_name[
+    match(ens_names, bulk_DEGs$ensembl_gene_id)
+  ]
+  
+  keep_ens <- which(is.na(gene_names)) # keeping ensemble names if NA
+  gene_names[keep_ens] <- ens_names[keep_ens]
+  
+  keep_ens <- which(duplicated(gene_names)) # keeping ensembl names if duplicated
+  gene_names[keep_ens] <- ens_names[keep_ens]
+  gene_names
+}
+
+row.names(expr) <- add_gene_names()
+
+saveRDS(colData(vst_combined), "data/output/CTSN_J.Hsu_coldata.rds")
+saveRDS(expr, "data/output/CTSN_J.Hsu_expr.rds")
+```
+
+## format expr matrix from normalized counts
+
+```{r}
+# change gene names
+expr <- norm_counts
+row.names(expr) <- add_gene_names()
+
+saveRDS(expr, "data/output/CTSN_J.Hsu_norm_counts.rds")
+```
+
+# DE with combined datasets
+
+```{r}
+# remove low count genes
+min_counts <- rowSums(counts(dds_combined)) >= 20
+dds_combined <- dds_combined[min_counts,]
+colData(dds_combined)$dataset <- factor(colData(dds_combined)$dataset)
+dds_combined$rhythm <- as.factor(gsub("Ctl", "CTL", dds_combined$rhythm))
+dds_combined$rhythm <- relevel(dds_combined$rhythm, ref = "CTL")
+
+design(dds_combined) <- formula(~ sex + dataset + rhythm)
+dds_cond <- DESeq(dds_combined)
+res <- lfcShrink(dds_cond, coef = "rhythm_AF_vs_CTL")
+res <- as.data.frame(res)
+
+# rename
+res$gene_name <- add_gene_names(res)
+
+saveRDS(res, "data/output/CTSN_J.Hsu_meta-analysis_DEG.rds")
+```

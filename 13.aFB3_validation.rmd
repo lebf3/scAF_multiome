@@ -1,0 +1,205 @@
+---
+title: "aFB3_validation"
+author: "Francis Leblanc"
+date: '2023-11-23'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(harmony)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(ggpubr)
+library(cowplot)
+library(dplyr)
+
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA)
+    )
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+```
+
+# clustering function
+
+```{r}
+Cluster_RNA_Harmony <- function(seurat.object,
+                                var.reg = "percent.mt",
+                                res = 0.8,
+                                dims = 30,
+                                var.features = NULL) {
+  set.seed(2022)
+  DefaultAssay(seurat.object) <- "RNA"
+  
+  SCTransform(seurat.object, 
+              verbose = T, 
+              vars.to.regress = var.reg, 
+              conserve.memory = T, 
+              residual.features = var.features, 
+              assay = "RNA") %>% 
+    RunPCA(npcs = dims) %>% 
+    RunHarmony(group.by.vars = c("sample"), assay.use = "SCT") %>% 
+    RunUMAP(dims = 1:dims, 
+            reduction = "harmony", 
+            reduction.name = 'umap.rna.harmony', 
+            reduction.key = 'rna.harmony.UMAP_') %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:dims) %>% 
+    FindClusters(verbose = FALSE, resolution = res) 
+}
+```
+
+# Merge samples
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE224959 
+
+```{r}
+data_dir <- list.dirs("data/input/GSE224959/", recursive = F, full.names = F)
+data_dir <- paste0("data/input/GSE224959/", data_dir, "/filtered_feature_bc_matrix")
+samples <- limma::strsplit2(data_dir,"_")[,2] 
+group <- limma::strsplit2(data_dir,"_")[,3] %>% 
+  gsub("MR", "AF", x=.)
+
+l <- list()
+
+l <- lapply(1:length(data_dir), function(x){
+  raw_input10x <- Read10X(data_dir[x])
+  seurat_object <- CreateSeuratObject(counts = raw_input10x, 
+                                      project = "PilotEx", 
+                                      min.cells = 0, 
+                                      min.features = 0)
+  seurat_object$sample <- samples[x]
+  seurat_object$group <- group[x]
+  print(paste0(samples[x], " done"))
+  seurat_object
+})
+
+seurat_object <- merge(l[[1]], y = l[2:length(data_dir)])
+```
+
+# pre-processing
+
+```{r}
+seurat_object <- NormalizeData(seurat_object)
+seurat_object$percent.mt <- PercentageFeatureSet(seurat_object, 
+                                                 pattern = "^MT-")
+seurat_object <- subset(seurat_object, subset = percent.mt < 20)
+```
+
+# doublet calling
+
+```{r}
+seurat_object <- Cluster_RNA_Harmony(seurat_object,
+                                     res = 0.3,
+                                     dims = 30,
+                                     var.reg = "percent.mt")
+
+DefaultAssay(seurat_object) <- "RNA"
+sce <- as.SingleCellExperiment(seurat_object)
+
+sce <- scDblFinder(sce, 
+                   clusters = "seurat_clusters", 
+                   samples = "sample", 
+                   BPPARAM = BiocParallel::SnowParam(3))
+
+keep <- c("scDblFinder.class", 
+          "scDblFinder.score", 
+          "scDblFinder.weighted", 
+          "scDblFinder.difficulty", 
+          "scDblFinder.cxds_score", 
+          "scDblFinder.mostLikelyOrigin", 
+          "scDblFinder.originAmbiguous")
+
+RNA_dblt <- sce@colData[, keep]
+
+saveRDS(RNA_dblt, "data/output/GSE224959_scDblFinder.rds")
+RNA_dblt <- readRDS("data/output/GSE224959_scDblFinder.rds")
+
+seurat_object@meta.data <- cbind(seurat_object@meta.data, 
+                                 RNA_dblt[colnames(seurat_object), ])
+```
+
+# Fibroblast sub-clustering
+
+```{r}
+FeaturePlot(seurat_object, "DCN") | DimPlot(seurat_object, label = T)
+
+FB <- subset(seurat_object, idents = 6) # fibroblast cluster
+FB <- subset(FB, subset = scDblFinder.class == "singlet")
+FB <- Cluster_RNA_Harmony(FB, 
+                          res = 0.3, 
+                          dims = 10, 
+                          var.reg = "percent.mt")
+DimPlot(FB, label = T)
+
+# remove remaining cells that are not FB and re-cluster
+markers <- presto::wilcoxauc(FB)
+FB <- subset(FB, subset = seurat_clusters != 5) # monocytes
+FB <- Cluster_RNA_Harmony(FB, 
+                          res = 0.3,
+                          dims = 10,
+                          var.reg = "percent.mt")
+
+# aFB3 cluster identification
+p1 <- DimPlot(FB, label = T) + 
+  NoLegend() + 
+  NoAxes() +
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.25, top = 0.25) 
+  
+p2 <- Nebulosa::plot_density(FB, "NR4A1") + 
+  NoAxes() +
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.25, top = 0.25) 
+```
+
+# compare AUC from cluster 3 to LFB
+
+```{r}
+# get AUC for LFB
+FB_snAF <- readRDS("data/output/FB_scAF.rds") 
+FB_snAF <- RenameIdents(FB_snAF, '0' = "aFB1", '1' = "aFB2", '2' = "aFB3")
+markers_FB_snAF <- presto::wilcoxauc(FB_snAF)
+markers_aFB3 <- dplyr::filter(markers_FB_snAF, group == "aFB3")
+
+# get AUC for sub-FB cluster 3
+m_3 <- presto::wilcoxauc(FB) %>% 
+  dplyr::filter(group == "3") %>% 
+  arrange(desc(auc))
+
+# plot AUCs
+markers_df <- data.frame(scAF.AUC = markers_aFB3$auc, 
+                         Elinor.AUC = m_3$auc[match(markers_aFB3$feature,
+                                                      m_3$feature)],
+                         feautre = markers_aFB3$feature)
+markers_df$labels <- ifelse(markers_df$scAF.AUC > 0.65 & 
+                              markers_df$Elinor.AUC > 0.65, 
+                            markers_df$feautre, NA)
+
+p3 <- ggscatter(markers_df, 
+                x = "scAF.AUC", 
+                y = "Elinor.AUC", 
+                repel = T,
+                font.label = c(8, "plain"), 
+                cor.coef = T, 
+                label = "labels", 
+                size = 1,
+                xlab = "aFB3 AUC", 
+                ylab = "GSE224959 FB cluster 3 AUC") +
+  geom_hline(yintercept = 0.5, color = "darkred") +
+  geom_vline(xintercept = 0.5, color = "darkred")
+
+(p1|p2) + p3 + plot_layout(ncol = 2, nrow = 2)
+ggsave("figs/aFB3_validation/NR4A1_UMAP_AUC.png", width = 9, height = 9)
+```

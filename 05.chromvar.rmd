@@ -1,0 +1,207 @@
+---
+title: "chromvar"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(cowplot)
+library(Signac)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(patchwork)
+library(JASPAR2020)
+library(TFBSTools)
+library(dplyr)
+
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA)
+    )
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+
+small_legend <- theme(legend.title = element_text(size = 10),
+                      legend.key.size = unit(0.2, "in"),
+                      legend.text = element_text(size = 10)) 
+```
+
+# TF Motifs 
+
+## Run chromvar
+
+```{r}
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+ct <- levels(scAF$WNN.sub.ct)
+set.seed(2022)
+
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(x = JASPAR2020,
+                    opts = list(collection = "CORE",
+                                tax_group = "vertebrates",
+                                all_versions = FALSE))
+
+# add motif information
+DefaultAssay(scAF) <- "peaks2"
+scAF <- AddMotifs(object = scAF,
+                  genome = BSgenome.Hsapiens.UCSC.hg38,
+                  pfm = pfm)
+
+# Run chromvar
+scAF <- RunChromVAR(object = scAF,
+                    genome = BSgenome.Hsapiens.UCSC.hg38)
+
+DefaultAssay(scAF) <- "chromvar"
+saveRDS(scAF, "data/output/scAF_peaks2.rds")
+```
+
+## Plot motif overrepresentation by cell-type
+
+### select TFs based on expression and motif activity
+
+```{r}
+chromvar_markers <- presto:::wilcoxauc.Seurat(X = scAF,
+                                              group_by = "WNN.sub.ct",
+                                              assay = "data",
+                                              seurat_assay = "chromvar")
+
+chromvar_markers$TF.name <- ConvertMotifID(id = chromvar_markers$feature, 
+                                           object = scAF, 
+                                           assay = "peaks2") 
+
+marker_TFs <- presto:::wilcoxauc.Seurat(X = scAF,
+                                     group_by = "WNN.sub.ct",
+                                     assay = "data",
+                                     seurat_assay = "RNA")
+
+# keep only TFs with gene expression information
+TFs <- unique(toupper(chromvar_markers$TF.name))
+```
+
+### Select top TFs for each cell-type based on motif and expression specificity (AUC)
+
+```{r}
+# Compute AUC and merge
+marker_TFs <- marker_TFs %>% 
+  filter(feature %in% TFs) %>% 
+  mutate(TF_group = paste0(feature,"_", group))
+
+chromvar_markers <- chromvar_markers %>% 
+  mutate(TF_upper = toupper(TF.name)) %>% 
+  mutate(TF_group = paste0(TF_upper,"_", group)) 
+  
+
+chromvar_markers$auc_TF_expr <- marker_TFs$auc[
+  match(chromvar_markers$TF_group, marker_TFs$TF_group)
+  ]
+
+chromvar_markers <- chromvar_markers %>% 
+  mutate(combined_auc = auc * auc_TF_expr)
+
+top_tf_motif <- chromvar_markers %>%
+  filter(group != "Mast" &
+                  auc > 0.60 & 
+                  auc_TF_expr > 0.60) %>%
+  arrange(desc(combined_auc))
+
+markers_out <- chromvar_markers %>%
+  filter(group != "Mast" & auc > 0.60) %>%
+  arrange(desc(combined_auc)) %>%
+  select(-c(TF_upper, TF_group))
+rio::export(markers_out, "results/TF_motifs_cell_types.csv")
+```
+
+### Plot top motifs
+
+```{r}
+# Remove duplicate TF names and select the top marker per group, then plot
+top_tf_motif <- top_tf_motif %>%
+  filter(!TF_upper %in% TF_upper[duplicated(TF_upper)]) %>%
+  group_by(group) %>%
+  slice_max(combined_auc, n = 1) %>%
+  mutate(group = factor(group, levels = ct)) %>%
+  arrange(group) %>%
+  ungroup()
+
+Idents(scAF) <- "WNN.sub.ct"
+dp <- DotPlot(scAF, 
+              assay = "chromvar", 
+              features = top_tf_motif$feature, 
+              idents = c(top_tf_motif$group),
+              dot.min = 0.25) + 
+  scale_colour_viridis_c() + 
+  xlab(NULL) + 
+  ylab(NULL) + 
+  ggtitle("Motif activity") +
+  scale_x_discrete(breaks = top_tf_motif$feature,
+                   labels = paste0(top_tf_motif$feature,
+                                   "_", 
+                                   top_tf_motif$TF.name)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  NoLegend()
+
+dp2 <- DotPlot(scAF, 
+               assay = "RNA", 
+               features = top_tf_motif$TF_upper, 
+               idents = c(top_tf_motif$group),
+               dot.min = 0.25) + 
+  scale_colour_viridis_c() + 
+  xlab(NULL) + 
+  ylab(NULL) + 
+  ggtitle("TF expression") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.text.y = element_blank()) + 
+  small_legend
+
+dp + dp2
+ggsave("figs/chromvar/dotplot_Marker_motifs_TF-expr.png", width = 8, height = 5)
+```
+
+### UMAP of the top CM and FB TFs with blended motif activity and TF expression
+
+```{r}
+DefaultAssay(scAF) <- "RNA"
+l.p <- list()
+l.p <- lapply(1:2, function(x) {
+  
+  # split elements of the plot for more flexibility 
+  l_p_tmp <- FeaturePlot(scAF,
+                    features = c(top_tf_motif$TF_upper[x],
+                                 top_tf_motif$feature[x]),
+                    blend = TRUE,
+                    reduction = "harmony_wnn_peaks2_umap",
+                    combine = F)
+  
+  # UMAP
+  p1 <- l_p_tmp[[3]] +
+    NoLegend() +
+    NoAxes() +
+    labs(title = "")
+  
+  # legend
+  p2 <- l_p_tmp[[4]] +
+    labs(title = "") +
+    ylab(top_tf_motif$feature[x])
+    
+  p1 + inset_element(p2, left = 0.7, bottom = 0.7, right = 1.05, top = 1.05)
+})
+
+wrap_plots(l.p) &
+  inset_element(p_umap, left = -0.01, bottom = -0.01, right = 0.25, top = 0.25)
+ggsave("figs/chromvar/UMAP_Motif_TF_CM-FB.png", width = 10, height = 5)
+```

@@ -1,0 +1,581 @@
+---
+title: "DEG"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(cowplot)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(DESeq2)
+library(ggVennDiagram)
+library(UpSetR)
+library(rtracklayer) 
+library(Gviz)
+library(Signac)
+library(AnnotationHub)
+library(dplyr)
+
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA)
+    )
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) +
+  xlab("UMAP1") + 
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+
+sample_by_cond_colors_set <- c("#1B59C2", "#85B0FA","#1349A6", "#D3E1FA",
+                               "#EF323C","#AB151D","#FB8086")
+```
+
+# AF vs SR pseudobulk DEG
+
+```{r}
+scAF <- readRDS("data/output/scAF_peaks2.rds") 
+ct <- levels(scAF$WNN.sub.ct)
+ct <- ct[-grep("Mast",ct)]
+scAF$rhythm <- factor(scAF$rhythm, levels = c("SR","AF"))
+
+DefaultAssay(scAF) <- "RNA"
+Idents(scAF) <- "WNN.sub.ct"
+
+meta <- scAF@meta.data
+l.res <- lapply(levels(scAF$WNN.sub.ct), function(x){
+  
+  sub.x <- subset(scAF, subset = WNN.sub.ct == x)
+  
+  # remove lowly represented genes (less than 5% of cells)
+  b.m <- sub.x@assays$RNA@counts > 0
+  keep <- (rowSums(b.m) / dim(sub.x)[2]) > 0.05
+  
+  count_df <- AggregateExpression(sub.x, 
+                                  features = row.names(sub.x)[keep], 
+                                  group.by = "sample", 
+                                  slot = "count", 
+                                  assays="RNA")$RNA %>% 
+    as.data.frame()
+  
+  labels_df <- data.frame(
+    sample = colnames(count_df),
+    rhythm = meta$rhythm[match(colnames(count_df), meta$sample)],
+    sex = meta$sex[match(colnames(count_df), meta$sample)],
+    row.names = colnames(count_df)
+  )
+
+  des <- ~ sex + rhythm
+  res <- DESeqDataSetFromMatrix(countData = count_df,
+                                colData = labels_df,
+                                design = des) %>% 
+    DESeq() %>% 
+    lfcShrink(coef="rhythm_AF_vs_SR", type = "ashr") %>% 
+    as.data.frame() %>% 
+    mutate(genes = row.names(.), celltype = x)
+  
+  res
+
+})
+
+res <- do.call(rbind, l.res)
+saveRDS(res, "results/pseudobulk_DEG.rds")
+
+res %>%
+  filter(padj < 0.05) %>%
+  rio::export("results/pseudobulk_DEG_0.05.csv")
+```
+
+## Signed log10 FDR CTSN & J.Hsu vs scAF
+
+```{r}
+bulk_DEGs <- rio::import("results/bulk_DEGs.csv")
+scAF_DEG <- rename(res, L2FC = log2FoldChange)
+
+robust <- bulk_DEGs %>%
+  filter(CTSN.Stranded_padj < 0.05 & J.Hsu_padj < 0.05 & 
+                  sign(J.Hsu_L2FC) == sign(CTSN.Stranded_L2FC))  %>%
+  arrange(CTSN.Stranded_padj)
+
+scAF_DEG_s <- filter(scAF_DEG, padj < 0.05)
+
+combined_DEG <- merge(scAF_DEG_s,
+                      robust,
+                      by.x = "genes",
+                      by.y = "external_gene_name",
+                      all = T)
+
+combined_DEG$celltype <- factor(combined_DEG$celltype, levels = ct)
+
+# venn diagram of overlapping DEG Bulk vs snAF
+scAF_g <- scAF_DEG_s %>% 
+  pull(genes) %>% 
+  unique()
+bulk_g <- unique(robust$gene_name)
+
+l_DEG <- list(scAF = scAF_g, `CTSN & GSE69890` = bulk_g)
+p.venn1 <- ggVennDiagram(l_DEG, 
+                         label_geom = c("text"), 
+                         label_alpha = 1, 
+                         set_size = 3, 
+                         label_size = 3,
+                         category.names = c(" ", "  "))  +
+  scale_fill_gradient(low = "white", high = "grey") + 
+  scale_color_manual(values=c("black","black")) +
+  NoLegend() + 
+  geom_segment(aes(x = 500, y =  350, xend = 500, yend = 100),
+               size = 1,
+               arrow = arrow(length = unit(0.1, "in")) ,
+               lineend = "round")
+
+# Barplot DEG by cell-type
+gene_labl <- c("RNF216","LINC01479","IFNG-AS1","SLC27A6","TRDN-AS1","RGS6")
+
+robust_DEG <- combined_DEG %>% 
+  filter(CTSN.Stranded_padj < 0.05 & padj < 0.05 & J.Hsu_padj < 0.05) %>% 
+  mutate(label = ifelse(genes %in% gene_labl, genes, NA))
+
+p.bar <- ggplot(robust_DEG, aes(y = celltype)) +
+  geom_bar() +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text = element_text(size = 8)) +
+  scale_x_discrete(limits = c(4, 8, 12))
+
+# scatter L2FC DEG Bulk vs snAF
+robust_DEG <- robust_DEG %>%
+  mutate(signed.fdr.scAF = sign(L2FC) * -log10(padj),
+         signed.fdr.ctsn = sign(CTSN.Stranded_L2FC) * -log10(CTSN.Stranded_padj))
+
+p1 <- ggplot(robust_DEG, aes(x = signed.fdr.scAF,
+                             y = signed.fdr.ctsn,
+                             color = celltype,
+                             fill = celltype,
+                             label = label)) +
+  geom_point(shape = 21, color = "black", alpha = 0.8, size = 3) +
+  theme_minimal() +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) + 
+  ggrepel::geom_label_repel(color = "black",
+                            fill = "white",
+                            alpha = 0.8,
+                            min.segment.length = 0.1,
+                            nudge_x = 0.1,
+                            nudge_y = 5,
+                            size = 4) +
+  ylab("Signed log10(FDR) CTSN") + 
+  xlab("Signed log10(FDR) scAF") +
+  labs(fill = "Cell-type")
+
+p1 <- p1 + 
+  inset_element(p.venn1, left = -0.01, bottom = 0.70, right = 0.4, top = 1) + 
+  inset_element(p.bar, left = -0.01, bottom = 0.5, right = 0.3, top = 0.75)
+ggsave(plot = p1, 
+       "figs/pseudo_deg/scatter_signedFDR_CTSN_scAF.png", 
+       width = 8, 
+       height = 6)
+```
+
+## Sc DEG jitter
+Show the number of DEG for each cell-type and the DEG replicated in bulk
+
+```{r}
+combined_DEG <- merge(scAF_DEG,
+                      bulk_DEGs,
+                      by.x = "genes",
+                      by.y = "external_gene_name",
+                      all.x = T) %>% 
+  mutate(signed.pval.scAF = sign(L2FC) * -log10(pvalue),
+         is.DE = padj < 0.05,
+         is.DE = ifelse(is.na(is.DE), FALSE, is.DE))
+
+# barplot for the number of upregulated and downregulated DEG by celltype
+deg_counts <- combined_DEG %>% 
+  filter(is.DE) %>% 
+  mutate(direction = ifelse(L2FC > 0 , "Up", "Down")) %>% 
+  group_by(celltype, direction) %>%
+  count() 
+
+deg_counts_up <- deg_counts  %>% 
+  filter(direction == "Up") %>%
+  arrange(n) 
+
+p.up <- deg_counts_up %>%
+  mutate(celltype = factor(celltype,
+                           levels = as.character(deg_counts_up$celltype))) %>%
+  ggplot(aes(y = celltype, x = n, label = n)) +
+  geom_col() +
+  geom_text(hjust = -0.5, size = 2.5) +
+  xlab("DEG count up") +
+  xlim(0, 95) +
+  ylab(NULL) +
+  theme_cowplot(font_size = 10) 
+
+deg_counts_d <- deg_counts  %>% 
+  filter(direction == "Down") %>%
+  arrange(n) 
+deg_counts_d$celltype <- factor(deg_counts_d$celltype, levels = deg_counts_d$celltype)
+
+p.d <- deg_counts_d %>%
+  mutate(celltype = factor(celltype,
+                           levels = as.character(deg_counts_d$celltype))) %>%
+  ggplot(aes(y = celltype, x = n, label = n)) +
+  geom_col() +
+  geom_text(hjust = -0.5, size = 2.5) +
+  xlab("DEG count down") +
+  xlim(0, 60) + ylab(NULL) +
+  theme_cowplot(font_size = 10)    
+
+# plot DEG FDR by celltype with labels for bulk replicated DEG
+combined_DEG <- combined_DEG %>%
+  mutate(
+    robust = ifelse(
+      padj < 0.05 &
+        CTSN.Stranded_padj < 0.05 &
+        J.Hsu_padj < 0.05 &
+        sign(L2FC) == sign(CTSN.Stranded_L2FC),
+      genes,
+      NA
+    )
+  ) %>% 
+  mutate(celltype = factor(celltype, levels = c('CM',
+                                                 'Adipo',
+                                                 'Endocardial',
+                                                 'EC',
+                                                 'FB',
+                                                 'Mesothelial',
+                                                 'Myeloid',
+                                                 'Lymphoid',
+                                                 'Mast',
+                                                 'PC',
+                                                 'Neuron',
+                                                 'SMC')))
+
+pos <- position_jitter(width = 0.3, seed = 2)
+
+combined_DEG %>%
+  ggplot(aes(x = celltype, y = signed.pval.scAF, label = robust)) +
+  geom_jitter(aes(color = is.DE, alpha = is.DE, size = is.DE), position = pos) +
+  ggrepel::geom_label_repel(alpha = 0.7, 
+                            size = 3,
+                            min.segment.length = 0.1,
+                            position = pos) +
+  scale_color_manual(values = c("black", "darkred")) +
+  scale_alpha_manual(values = c(0.2, 0.8, 0.2)) +
+  scale_size_manual(values = c(0.5, 1, 0.5)) +
+  xlab("Cell-types") +
+  ylab("Signed log10(p-value)") +
+  labs(color = "DEG") +
+  guides(alpha = F, size = F) +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1),
+        legend.position = c(.1, .95),
+        legend.direction = "horizontal") +
+  ylim(-20, 20) +
+  inset_element(p.up, left = .6, right = .98, bottom = 0.70, top = 1) +
+  inset_element(p.d, left = .6, right = .98, bottom = 0, top = .30)
+  
+ggsave("figs/pseudo_deg/scatter_signed.p_scAF.png", width = 8, height = 6)
+```
+
+# upset comparison of different bulk DEGs 
+
+```{r}
+CTSN_down <- bulk_DEGs %>%
+  filter(CTSN.Stranded_padj < 0.05 &
+                  sign(CTSN.Stranded_L2FC) == -1) %>%
+  pull(GENEID)
+
+CTSN_up <- bulk_DEGs %>%
+  filter(CTSN.Stranded_padj < 0.05 &
+                  sign(CTSN.Stranded_L2FC) == 1) %>%
+  pull(GENEID)
+
+J.Hsu_down <- bulk_DEGs %>%
+  filter(J.Hsu_padj < 0.05 & sign(J.Hsu_L2FC) == -1) %>%
+  pull(GENEID)
+
+J.Hsu_up <- bulk_DEGs %>%
+  filter(J.Hsu_padj < 0.05 & sign(J.Hsu_L2FC) == 1) %>%
+  pull(GENEID)
+
+l_DEG <- list(`CTSN DEG down` = CTSN_down,
+              `CTSN DEG up` = CTSN_up,
+              `GSE69890 DEG down` = J.Hsu_down,
+              `GSE69890 DEG up` = J.Hsu_up)
+
+png("figs/pseudo_deg/Upse.DEG_CTSN.GSE69890.png", 
+    width = 6, 
+    height = 4, 
+    units = "in", 
+    res = 300)
+upset(fromList(l_DEG), order.by = "freq")
+dev.off()
+```
+
+# Identifying DEG genomic positions hotspots in both bulk datasets
+## Miami plot (mirror Manhattan plot for both datasets)
+
+```{r}
+DEG_pos <- bulk_DEGs %>% 
+  distinct(gene_name, .keep_all = T) %>% 
+  filter(!is.na(chromosome_name)) %>% 
+  filter(!chromosome_name == "") %>% 
+  mutate(CHR = factor(chromosome_name, levels = c(seq(1,22), "X", "Y", "MT")),
+         label = ifelse(CTSN.Stranded_padj < 10e-8 & J.Hsu_padj < 10e-8, 
+                        gene_name, 
+                        NA))
+
+# assign continuous x-axis positions across chromosomes
+DEG_pos <- DEG_pos[order(DEG_pos$CHR), ]
+nCHR <- length(unique(DEG_pos$CHR))
+DEG_pos$BPcum <- NA
+s <- 0
+nbp <- c()
+for (i in unique(DEG_pos$CHR)){
+  nbp[i] <- max(DEG_pos[DEG_pos$CHR == i,]$start_position)
+  DEG_pos[DEG_pos$CHR == i, "BPcum"] <-
+    DEG_pos[DEG_pos$CHR == i, "start_position"] + s
+  s <- s + nbp[i]
+}
+
+axis_set <- DEG_pos %>% 
+  group_by(CHR)%>% 
+  summarize(center = (max(BPcum) + min(BPcum)) / 2)
+ylim <- abs(floor(log10(min(DEG_pos$CTSN.Stranded_padj, na.rm = T)))) + 2 
+sig <- 5e-2
+DEG_pos$CTSN.Stranded_padj[DEG_pos$CTSN.Stranded_padj > 0.05] <- NA  
+DEG_pos$J.Hsu_padj[DEG_pos$J.Hsu_padj > 0.05] <- NA
+
+# color J.Hsu hits with strand bias try using X as shape with red color
+strand_dep <- filter(DEG_pos, Stranded_dependent)
+
+ticks_r <- c(-log10(DEG_pos$CTSN.Stranded_padj), 
+             (-log10(DEG_pos$J.Hsu_padj)) * -1)
+
+manhplot <- DEG_pos %>% 
+  ggplot(aes(x = BPcum, y = -log10(CTSN.Stranded_padj), label = label)) +
+  geom_point(aes(color = as.factor(CHR), size = -log10(CTSN.Stranded_padj)), 
+             alpha = 0.75) +
+  geom_point(aes(x = BPcum,
+                 y = (-log10(J.Hsu_padj)) * -1,
+                 color = as.factor(CHR),
+                 size = -log10(J.Hsu_padj)),
+             alpha = 0.75) +
+  geom_point(data = strand_dep,
+             color = "darkred", 
+             shape = 4,
+             aes(x = BPcum,
+                 y = (-log10(J.Hsu_padj)) * -1,
+                 size = -log10(J.Hsu_padj))) + 
+  ggrepel::geom_label_repel(size = 3, min.segment.length = 0.1, alpha = 0.75) +
+  ggrepel::geom_label_repel(aes(x = BPcum, y = -log10(J.Hsu_padj) * -1), 
+                            size = 3, 
+                            min.segment.length = 0.1,
+                            alpha = 0.75) +
+  scale_y_continuous(breaks = pretty(ticks_r),
+                     labels = abs(pretty(ticks_r))) +
+  scale_color_manual(values = rep(c("grey41", "black"), nCHR)) +
+  scale_size_continuous(range = c(0.5, 3)) +
+  labs(x = NULL, y = expression(paste(-Log[10], italic("FDR")))) + 
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.border = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text.x = element_blank())
+
+
+manhplot <- manhplot + 
+  annotate("text",
+           x = min(DEG_pos$BPcum),
+           y = c(-35,35),
+           label = c("bold(J.Hsu)","bold(CTSN)"),
+           colour = "black",
+           size = 3,
+           hjust=.2,
+           parse = TRUE) +
+  annotate("text",
+           x = axis_set$center,
+           y = 0,
+           label = axis_set$CHR,
+           colour = "black") 
+manhplot
+ggsave("figs/pseudo_deg/MIAMI_CTSNvsJ.Hsu.png", width = 10, height = 6)
+```
+
+## Show strand bias at IFNG locus with coverage plot
+
+```{r}
+# pull genes from IFNG locus
+IFNG_locus <- bulk_DEGs %>%
+  rename(genes = gene_name) %>% 
+  filter(chromosome_name == 12 &
+                  start_position > 67800000 &
+                  start_position < 68330000) %>%
+  distinct(genes, .keep_all = T)
+IFNG_locus_genes <- pull(IFNG_locus, genes)
+
+# plot annotation at the locus
+ah <- AnnotationHub() # snapshotDate(): 2022-10-31
+ahDb <- query(ah, pattern = c("Homo Sapiens", "EnsDb", "105"))
+ensdb <- ah[["AH98047"]]
+
+p.anno <- ggbio::autoplot(ensdb,
+                          ~ symbol %in% IFNG_locus_genes,
+                          names.expr = "gene_name",
+                          aes(color = strand, fill = strand)) +
+  xlim(67800000, 68330000) +
+  theme(legend.position = "right") +
+  ylab("Genes")
+
+# label gene strand and differential expression accounting for strand or not
+df <- IFNG_locus %>%
+  dplyr::select(CTSN.Unstranded_pvalue,
+                CTSN.Stranded_pvalue,
+                start_position,
+                genes) %>%
+  tidyr::pivot_longer(cols = c(CTSN.Unstranded_pvalue, CTSN.Stranded_pvalue),
+                      names_to = "Alignment") %>% 
+  mutate(label = ifelse(Alignment == "CTSN.Stranded_pvalue", genes, NA)) %>% 
+  mutate(label = ifelse(
+    label %in% c("AC007458.1", "HNRNPA1P70", "IFNG-AS1", "LINC01479"),
+    paste0("(+) ", label),
+    paste0("(-) ", label)
+  )) %>% 
+  mutate(Alignment = ifelse(Alignment == "CTSN.Stranded_pvalue",
+                            "Stranded",
+                            "Non-stranded"))
+
+df$label[grep(") NA", df$label)] <- NA
+
+p.pvals <- ggplot(df, aes(x = start_position,
+                          y = -log10(value),
+                          color = Alignment,
+                          label = label)) +
+  geom_point(alpha = 0.8, size = 3) +
+  theme(legend.position = "right") +
+  scale_color_manual(values = c("#566D99", "#BD8966")) +
+  ggrepel::geom_text_repel(color = "black", nudge_x = 10000, size = 3) +
+  ylab(expression(paste(-Log[10], italic("P")))) + 
+  xlab(NULL)
+
+# plot IFNG locus coverage by rhythm 
+AF_cov <- import.bw("data/input/AFs.bw", as = "GRanges") 
+AF_cov <- keepSeqlevels(AF_cov, c(1:22, "X", "Y"), pruning.mode = "coarse")
+IFNG_AF_cov <- subsetByOverlaps(AF_cov, 
+                                StringToGRanges("12-67900000-68330000")) %>% 
+  as.data.frame()
+IFNG_AF_cov$rhythm <- "AF"
+
+CTL_cov <- import.bw("data/input/Ctls.bw", as = "GRanges") 
+CTL_cov <- keepSeqlevels(CTL_cov, c(1:22, "X", "Y"), pruning.mode = "coarse")
+IFNG_SR_cov <- subsetByOverlaps(CTL_cov, 
+                                StringToGRanges("12-67900000-68330000")) %>% 
+  as.data.frame()
+IFNG_SR_cov$rhythm <- "SR"
+cov <- rbind(IFNG_AF_cov, IFNG_SR_cov)
+
+p.cov <- ggplot(cov, aes(x = start, y = score, color = rhythm)) +
+  geom_line(size = 0.5, alpha = 0.4) +
+  scale_color_manual(values = c("darkred", "blue")) +
+  ylab("Coverage")
+
+png("figs/pseudo_deg/Strand_IFNG_locus.png", 
+    width = 10, 
+    height = 7, 
+    units = "in", 
+    res = 300)
+ggbio::tracks(p.cov, p.pvals, p.anno, heights = c(1, 1.5, 1))
+dev.off()
+```
+
+## IFNG-AS1 UMAP and violin plots
+
+```{r}
+DefaultAssay(scAF) <- "RNA"
+scAF$sample <- forcats::fct_rev(scAF$sample)
+scAF$rhythm <- forcats::fct_rev(scAF$rhythm)
+
+p1 <- FeaturePlot(scAF, 
+                  c("LINC01479", "IFNG-AS1"),
+                  reduction = "harmony_wnn_peaks2_umap",
+                  split.by = "rhythm") & 
+  NoAxes() & 
+  NoLegend() &
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.3, top = 0.3)
+
+p2 <- subset(scAF, subset = WNN.sub.ct == "CM") %>%
+  VlnPlot("LINC01479", 
+          group.by = "sample", 
+          cols = sample_by_cond_colors_set[7:1]) +
+  xlab(NULL) + 
+  NoLegend() + 
+  theme(axis.text.x = element_blank())
+
+p3 <- subset(scAF, subset = WNN.sub.ct == "CM") %>%
+  VlnPlot("IFNG-AS1", 
+          group.by = "sample", 
+          cols = sample_by_cond_colors_set[7:1]) +
+  xlab("Sample") + 
+  NoLegend()
+
+layout <- "
+ABE
+CDF
+"
+p1 + p2 + p3 + plot_layout(design = layout, widths = c(1, 1, .8))
+ggsave("figs/pseudo_deg/UMAP_vlnplot_LINC01479_IFNG-AS1.png", 
+       width = 8, 
+       height = 6)
+```
+
+# bulk RNAseq boxplots
+## IFNG-AS1 + LINC01479
+
+```{r}
+bulk_LAA_expr <- readRDS("data/output/CTSN_J.Hsu_norm_counts.rds")
+
+coldat_LAA <- readRDS("data/output/CTSN_J.Hsu_coldata.rds") %>% 
+  as.data.frame() %>% 
+  mutate(rhythm = as.factor(gsub("Ctl", "CTL", rhythm)),
+         LINC01479 = bulk_LAA_expr["LINC01479",],
+         `IFNG-AS1` = bulk_LAA_expr["IFNG-AS1",])
+
+bulk_boxplot <- function(gene = "LINC01479") {
+  gene <- ensym(gene) 
+  
+  coldat_LAA %>%
+    dplyr::filter(rhythm %in% c("AF", "CTL")) %>%
+    mutate(rhythm = recode(rhythm, CTL = "SR")) %>%
+    ggplot(aes(y = !!gene, x = rhythm, fill = rhythm)) +
+    geom_jitter() +
+    geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+    scale_fill_manual(values = c("darkred", "blue")) +
+    NoLegend() +
+    ylab(paste0(gene, " normalized counts"))
+}
+p <- bulk_boxplot()
+p1 <- facet(p, facet.by = "dataset")  
+
+p <- bulk_boxplot("IFNG-AS1")
+p2 <- facet(p, facet.by = "dataset")  
+
+p1|p2
+ggsave("figs/pseudo_deg/bulk_boxplot_LINC01479_IFNG-AS1.png",
+       width = 7, 
+       height = 6)
+```

@@ -1,0 +1,348 @@
+---
+title: "Metacells"
+author: "Francis Leblanc"
+date: '2022-09-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(harmony)
+library(Seurat)
+library(Signac)
+library(hdWGCNA)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(EnsDb.Hsapiens.v86)
+library(JASPAR2020)
+library(TFBSTools)
+library(biomaRt)
+library(dplyr)
+
+set.seed(2022)
+```
+
+# functions
+
+```{r}
+process_seurat <- function(obj, 
+                           n_dims, 
+                           harmony_vars = "sample", 
+                           vars.regress = NULL) {
+  NormalizeData(obj) %>% 
+    SCTransform(assay = "RNA", 
+                verbose = F, 
+                conserve.memory = F, 
+                vars.to.regress = vars.regress) %>% 
+    RunPCA(npcs = n_dims, assay = "SCT", reduction.name = "pca_new") %>% 
+    RunHarmony(group.by.vars = harmony_vars, 
+               assay.use = "SCT", 
+               reduction = "pca_new", 
+               reduction.save = "harmony") %>% 
+    RunUMAP(dims = 1:n_dims,
+            reduction = "harmony", 
+            reduction.name = "harmony.UMAP") %>% 
+    FindNeighbors(obj, 
+                  dims = 1:n_dims, 
+                  verbose = FALSE, 
+                  reduction = "harmony")
+}
+
+Make_metacells <- function(so = seurat_obj,
+                           fraction = 0.05,
+                           wgcna_name = "AF",
+                           group.by = c("cell_type", "sample"),
+                           ident.group = "cell_type") {
+  # select genes
+  so <- SetupForWGCNA(seurat_obj = so,
+                      gene_select = "fraction", 
+                      fraction = fraction, 
+                      wgcna_name = wgcna_name)
+  
+  # construct metacells for each group
+  MetacellsByGroups(min_cells = 75,
+                          seurat_obj = so,
+                          reduction = "harmony",
+                          group.by = group.by,
+                          k = 30, 
+                          max_shared = 10, 
+                          ident.group = ident.group)
+}
+```
+
+# Create metacells
+## RNA
+
+```{r}
+bulk_DEG <- rio::import("results/bulk_DEGs.csv")
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+
+scAF$cell_type <- scAF$WNN.sub.ct
+DefaultAssay(scAF) <- "RNA"
+scAF@reductions$harmony@assay.used <- "RNA" # throws error otherwise
+
+scAF[["SCT"]] <- NULL
+scAF[["ATAC"]] <- NULL
+scAF[["chromvar"]] <- NULL
+
+scAF_meta <- Make_metacells(so = scAF)
+scAF_meta <- NormalizeMetacells(scAF_meta)
+meta_RNA <- GetMetacellObject(scAF_meta)
+```
+
+## ATAC
+
+```{r}
+scAF@reductions$harmony@assay.used <- "peaks2" # throws error otherwise
+DefaultAssay(scAF) <- "peaks2"
+
+scAF_meta <- Make_metacells(so = scAF, 
+                            fraction = 0.01, 
+                            wgcna_name = "peaks2")
+
+scAF_meta <- NormalizeMetacells(scAF_meta)
+meta_peaks2 <- GetMetacellObject(scAF_meta, wgcna_name = "peaks2")
+```
+
+### Create chromatin assay
+
+```{r}
+atac_counts <- meta_peaks2@assays$peaks2@counts
+
+# add ATAC-seq data
+grange_counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+grange_use <- seqnames(grange_counts) %in%
+  GenomeInfoDb::standardChromosomes(grange_counts)
+atac_counts <- atac_counts[as.vector(grange_use), ]
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+genome(annotations) <- "hg38"
+
+# change chromosome labels to match Cellranger
+seqlevels(annotations) <- paste0("chr", seqlevels(annotations))
+BSG <- seqinfo(BSgenome.Hsapiens.UCSC.hg38)
+seqlevelsStyle(BSG) <- "UCSC"
+
+chrom_assay <- CreateChromatinAssay(counts = atac_counts,
+                                    sep = c(":", "-"),
+                                    genome = BSG,
+                                    min.cells = 1,
+                                    annotation = annotations)
+
+# ATAC seurat object
+s_peaks <- CreateSeuratObject(counts = chrom_assay, assay = "peaks2")
+s_peaks <- RegionStats(object = s_peaks,
+                       assay = "peaks2",
+                       genome = BSgenome.Hsapiens.UCSC.hg38)
+
+meta_RNA[["peaks2"]] <- s_peaks[["peaks2"]]
+```
+
+## compute chromvar
+
+```{r}
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(x = JASPAR2020,
+                    opts = list(collection = "CORE",
+                                tax_group = 'vertebrates', 
+                                all_versions = FALSE))
+
+# add motif information
+DefaultAssay(meta_RNA) <- "peaks2"
+meta_RNA <- AddMotifs(object = meta_RNA,
+                      genome = BSgenome.Hsapiens.UCSC.hg38,
+                      pfm = pfm)
+
+# Run chromvar
+meta_RNA <- RunChromVAR(object = meta_RNA, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+DefaultAssay(meta_RNA) <- "chromvar"
+
+meta_RNA <- meta_RNA_old
+saveRDS(meta_RNA, "data/output/metacells/MetaCells_snAF.rds") 
+```
+
+# MI zones metacells
+
+```{r}
+# subset CM
+MI <- readRDS("data/input/snRNAseq_MI.rds")
+
+keep <- MI@meta.data %>% 
+  dplyr::filter(cell_type_original == "Cardiomyocyte") %>% 
+  row.names()
+cts <- MI@assays$RNA@counts[, keep] 
+
+# rename genes
+ensembl_hsa <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+gene_names <- getBM(attributes = c("ensembl_gene_id",
+                                            "external_gene_name"),
+                             filters = "ensembl_gene_id",
+                             values = row.names(cts),
+                             ensembl_hsa)
+
+new_names_df <- data.frame(
+  new_names = gene_names$external_gene_name[
+    match(row.names(cts), gene_names$ensembl_gene_id)
+  ],
+  GENEIDS = row.names(cts)
+)
+
+rio::export(new_names_df, "data/output/CM_MI_gene_names.csv")
+new_names_df <- rio::import("data/output/CM_MI_gene_names.csv")
+
+keep_old <- which(is.na(new_names_df$new_names) | new_names_df$new_names == "")
+new_names_df$new_names[keep_old] <- row.names(cts)[keep_old]
+row.names(cts) <- new_names_df$new_names
+
+# create Seurat object
+MI_cm <- CreateSeuratObject(cts[, keep], 
+                            project = "SeuratProject", 
+                            assay = "RNA",
+                            meta.data = MI@meta.data[keep, ])
+
+rm(MI, cts) 
+gc()
+
+# process data
+MI_cm <- process_seurat(MI_cm, n_dims = 15, harmony_vars = "sample")
+
+# Make MetaCell CM-MI
+DefaultAssay(MI_cm) <- "RNA"
+meta_MI_cm <- Make_metacells(so = MI_cm, 
+                             wgcna_name = "MI_cm",
+                             group.by = c("sample"),
+                             ident.group = 'sample')
+
+# Get MetaCells
+meta_MI_cm <- GetMetacellObject(meta_MI_cm)
+keep_cols <- c("major_labl", "patient_group", "patient", "final_cluster", "sex")
+meta_MI_cm@meta.data[, keep_cols] <- 
+  MI_cm@meta.data[match(meta_MI_cm$sample, MI_cm$sample), keep_cols]
+
+saveRDS(meta_MI_cm, "data/output/metacells/metacell_MI.cm.rds")
+```
+
+# Heart atlas LA + RA CM metacells
+
+```{r}
+hca_A <- SeuratDisk::LoadH5Seurat("data/input/hca_heart_atrial_CM_raw.h5seurat")
+hca_A <- subset(hca_A, subset = cell_source == "Harvard-Nuclei")
+
+hca_A$sample <- factor(hca_A$sample) # error if factor present with 0 instance
+hca_A <- process_seurat(hca_A, n_dims = 15, harmony_vars = "sample") 
+
+DefaultAssay(hca_A) <- "RNA"
+meta_hca <- Make_metacells(so = hca_A, 
+                           wgcna_name = "hca_A",
+                           group.by = c("sample"),
+                           ident.group = 'sample')
+
+# Get MetaCells
+meta_hca <- GetMetacellObject(meta_hca)
+keep_cols <- c("NRP",
+               "cell_source",
+               "donor",
+               "gender",
+               "region",
+               "age_group",
+               "type",
+               "version",
+               "cell_states")
+
+meta_hca@meta.data[, keep_cols] <- 
+  hca_A@meta.data[match(meta_hca$sample, hca_A$sample), keep_cols]
+
+saveRDS(meta_hca, "data/output/metacells/metacell_RA_LA_Harvard.rds")
+```
+
+# ACM + DCM CM metacells
+
+```{r}
+ACM_lv <- readRDS("data/output/CM_ACM_DCM_Reichart.LV.rds")
+
+# process data
+ACM_lv@meta.data <- dplyr::rename(ACM_lv@meta.data, sample = Sample)
+ACM_lv <- subset(ACM_lv, subset = assay == "10x 3' v3")
+
+ACM_lv$sample <- factor(ACM_lv$sample)
+ACM_lv <- process_seurat(ACM_lv, n_dims = 15, harmony_vars = "sample")
+
+meta_ACM <- Make_metacells(so = ACM_lv, 
+                           wgcna_name = "ACM_lv",
+                           group.by = c("sample"),
+                           ident.group = 'sample')
+
+# Get MetaCells
+meta_ACM <- GetMetacellObject(meta_ACM)
+keep_cols <-  c("Primary.Genetic.Diagnosis", "disease", "cell_states", "sex")
+
+meta_ACM@meta.data[, keep_cols] <- 
+  ACM_lv@meta.data[match(ACM_lv$sample, meta_ACM$sample), keep_cols]
+
+saveRDS(meta_ACM, "data/output/metacells/metacell_ACM.rds")
+```
+
+# Merge with other CM
+
+```{r}
+meta_MI <- readRDS("data/output/metacells/metacell_MI.cm.rds") 
+meta_hca <- readRDS("data/output/metacells/metacell_RA_LA_Harvard.rds")
+meta_ACM <- readRDS("data/output/metacells/metacell_ACM.rds")
+meta_LAA <- readRDS("data/output/metacells/MetaCells_snAF.rds")
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+
+keep_cols <-  c("sex", "rhythm")
+meta_LAA@meta.data[, keep_cols] <- 
+  scAF@meta.data[match(meta_LAA$sample, scAF$sample), keep_cols]
+meta_LAA <- subset(meta_LAA, cell_type == "CM")
+rm(scAF)
+gc()
+
+
+# harmonize labels for:
+# "sample", "region", "sex", "rhythm", "disease", "major_labl"
+## meta_LAA
+meta_LAA$sex <- recode(meta_LAA$sex, "Male" = "male", "Female" = "female") 
+meta_LAA$region <- "LAA"
+meta_LAA$major_labl <- paste0("LAA_", meta_LAA$rhythm)
+meta_LAA$disease <- meta_LAA$rhythm
+meta_LAA$dataset <- "LAA_AF"
+
+## meta_hca
+meta_hca$sex <- recode(meta_hca$gender, "M" = "male", "F" = "female") 
+meta_hca$major_labl <- meta_hca$region
+meta_hca$disease <- "CTRL"
+meta_hca$dataset <- "Atria_H.atlas"
+
+## meta_MI
+meta_MI$region <- "LV"
+meta_MI$disease <- meta_MI$major_labl
+meta_MI$dataset <- "MI"
+
+
+## meta_ACM
+meta_ACM$region <- "LV"
+meta_ACM$disease.long <- meta_ACM$disease
+levels(meta_ACM$disease) <- c("ACM","DCM","NCM","CTRL") 
+meta_ACM$major_labl <- meta_ACM$Primary.Genetic.Diagnosis
+meta_ACM$dataset <- "ACM_DCM"
+
+# merge
+meta_all <- merge(meta_hca, meta_LAA)
+meta_all <- merge(meta_all, meta_MI)
+meta_all <- merge(meta_all, meta_ACM)
+
+DefaultAssay(meta_all) <- "RNA"
+meta_all[["peaks2"]] <- NULL
+meta_all[["chromvar"]] <- NULL
+
+keep_cols <- c("sample",
+               "region",
+               "sex",
+               "rhythm",
+               "disease",
+               "major_labl",
+               "dataset")
+meta_all@meta.data <- meta_all@meta.data[, keep_cols]
+saveRDS(meta_all, "data/output/metacells/metacells_A_LAA_MI.rds")
+```

@@ -1,0 +1,277 @@
+---
+title: "00.external_data"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(SeuratDisk)
+library(Seurat)
+library(harmony)
+library(biomaRt)
+```
+
+# Reference data for annotating nuclei
+
+## Import, convert and filter human heart atlas PMID: 32971526
+
+```{r}
+url <- "https://cellgeni.cog.sanger.ac.uk/heartcellatlas/data/global_raw.h5ad"
+file_name <- "hca_heart_raw.h5ad"
+file_path <- "data/input/"
+curl::curl_download(url, paste0(file_path, file_name))
+
+Convert("data/input/hca_heart_raw.h5ad",
+        dest = "data/input/hca_heart_raw.h5seurat", 
+        overwrite = TRUE)
+
+hca_nuc <- LoadH5Seurat("data/input/hca_heart_raw.h5seurat")
+hca_LA <- subset(x = hca_nuc, subset = region == "LA")
+
+file.remove("data/input/hca_heart_raw.h5seurat",
+            "data/input/hca_heart_raw.h5ad")
+
+saveRDS(hca_LA, "data/output/Litvinukova2020_LA.RDS")
+```
+
+# Bulk RNAseq 
+
+## dataset GSE69890
+https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE69890&format=file
+
+```{r}
+pheno_EU <- read.csv("data/input/GSE69890/GSM1712025_phenotypes_euro.txt", 
+                     row.names = 1)
+pheno_AA <- read.csv("data/input/GSE69890/GSM1712025_phenotypes_aa.txt", 
+                     row.names = 1)  
+
+pheno <- cbind(pheno_EU[c("sexFemale", "AtrialRhythm"),],
+               pheno_AA[c("sexFemale", "AtrialRhythm"),])
+
+pheno <- as.data.frame(t(pheno))
+pheno[, 1:2] <- lapply(pheno, factor)
+levels(pheno$AtrialRhythm) <- c("CTL","AF", "AF_SR")
+levels(pheno$sexFemale) <- c("M","F")
+
+expression_data <- read.csv("data/input/GSE69890/GSM1712025_raw_counts.txt", 
+                            row.names = 1)
+
+keep <- colnames(expression_data) %in% row.names(pheno)
+expression_data <- expression_data[, keep]
+
+pheno <- pheno[match(colnames(expression_data), row.names(pheno)), ]
+saveRDS(pheno, "data/output/pheno_J.Hsu.rds")
+```
+
+## CTSN count matrix
+
+```{r}
+curl::curl_download(
+  url = "http://www.mhi-humangenetics.org/dataset/counts.ctsn.tsv", 
+  destfile = "data/input/counts.ctsn.tsv"
+  )
+
+curl::curl_download(
+  url = "http://www.mhi-humangenetics.org/dataset/meta.ctsn.tsv", 
+  destfile = "data/input/meta.ctsn.tsv"
+  )
+```
+
+# Pathways files from enrichr 
+https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName=MSigDB_Hallmark_2020
+https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName=GO_Biological_Process_2021
+Path : "data/input/Pathways"
+
+```{r}
+curl::curl_download(
+  url = "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName=MSigDB_Hallmark_2020", 
+  destfile = "data/input/Pathways/MSigDB_Hallmark_2020.txt"
+  )
+
+curl::curl_download(
+  url = "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName=GO_Biological_Process_2021", 
+  destfile = "data/input/Pathways/GO_Biological_Process_2021_test.txt"
+  )
+```
+
+# genecode V32 annotation 
+https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/gencode.v32.annotation.gtf.gz
+
+```{r}
+curl::curl_download(
+  url = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/gencode.v32.annotation.gtf.gz", 
+  destfile = "data/input/tx2gene.gencode.v32_test.gtf.gz"
+  )
+
+tx2gene <- rtracklayer::readGFF("data/input/tx2gene.gencode.v32.gtf.gz")
+tx2gene <- tx2gene %>% 
+  dplyr::filter(!is.na(transcript_id)) %>% 
+  distinct(transcript_id, .keep_all = T) %>% 
+  dplyr::select(transcript_id,
+                gene_id,
+                havana_gene,
+                havana_transcript,
+                transcript_name,
+                gene_name,
+                transcript_type)
+
+colnames(tx2gene) <- c("TXNAME",
+                       "GENEID",
+                       "HAVANA_G",
+                       "HAVANA_T",
+                       "SYMB_T",
+                       "SYMB",
+                       "BIOTYPE")
+tx2gene[is.na(tx2gene)] <- "-"
+rio::export(tx2gene, "data/output/tx2gene.gencode.v32.tsv.gz")
+```
+
+# ENCODE cCREs
+https://genome.ucsc.edu/cgi-bin/hgTables?hgsid=2272433756_zcFtYimQOFcbpCB0DmV58ixbBSn6&clade=mammal&org=Human&db=hg38&hgta_group=allTracks&hgta_track=encodeCcreCombined&hgta_table=0&hgta_regionType=genome&position=chr7%3A155%2C799%2C529-155%2C812%2C871&hgta_outputType=primaryTable&hgta_outFileName= 
+Path : "data/input"
+
+# Catlas peaks
+http://catlas.org/catlas_downloads/humantissues/cCRE_by_cell_type/
+Path : "data/input/Catlas"
+
+# Datasets for CM cross-dataset mapping
+## import and filter Reichart et al. (2022) Science
+https://cellxgene.cziscience.com/datasets
+Pathogenic variants damage cell composition and single cell transcription in cardiomyopathies
+DCM/ACM heart cell atlas: Cardiomyocytes schema_version 2.0.0
+
+```{r}
+ACM <- readRDS("data/input/CM_ACM_DCM_Reichart.rds") 
+
+Idents(ACM) <- "tissue"
+cts <- ACM@assays$RNA@counts[, ACM$tissue == "heart left ventricle"]
+
+ensembl_hsa <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+gene_names <- getBM(attributes = c("ensembl_gene_id",
+                                            "external_gene_name"),
+                             filters = "ensembl_gene_id",
+                             values = row.names(cts),
+                             ensembl_hsa)
+
+new_names_df <- data.frame(
+  new_names = gene_names$external_gene_name[
+    match(row.names(cts), gene_names$ensembl_gene_id)
+  ],
+  GENEIDS = row.names(cts)
+)
+
+re_name <- which(is.na(new_names_df$new_names))
+new_names_df$new_names[re_name] <- new_names_df$GENEIDS[re_name]
+
+rio::export(new_names_df, "data/output/CM_ACM_DCM_Reichart.LV.gene_names.csv")
+new_names_df <- rio::import("data/output/CM_ACM_DCM_Reichart.LV.gene_names.csv")
+
+row.names(cts) <- new_names_df$new_names
+
+ACM.lv <- CreateSeuratObject(cts, project = "ACM", assay = "RNA")
+ACM.lv <- AddMetaData(ACM.lv, metadata = ACM@meta.data)
+ACM.lv <- NormalizeData(ACM.lv, assay = "RNA")
+
+saveRDS(ACM.lv, "data/output/CM_ACM_DCM_Reichart.LV.rds")
+```
+
+## import MI data 
+https://cellxgene.cziscience.com/collections/8191c283-0816-424b-9b61-c3e1d6258a77
+Spatial multi-omic map of human myocardial infarction
+All-snRNA-Spatial multi-omic map of human myocardial infarction
+schema_version 2.0.0
+Path : "data/input/snRNAseq_MI.rds"
+
+## Import Heart atlas LA + RA CM
+
+```{r}
+curl::curl_download(
+  url = "https://cellgeni.cog.sanger.ac.uk/heartcellatlas/data/hca_heart_atrial_CM_raw.h5ad", 
+  destfile = "data/input/hca_heart_atrial_CM_raw.h5ad"
+  )
+
+SeuratDisk::Convert("data/input/hca_heart_atrial_CM_raw.h5ad", 
+                    dest = "h5seurat", 
+                    overwrite = TRUE)
+file.remove("data/input/hca_heart_atrial_CM_raw.h5ad")
+```
+
+# Datasets for FB cross-dataset mapping
+
+## Import DCM data 
+https://singlecell.broadinstitute.org/single_cell/study/SCP1303
+
+```{r}
+Convert("data/input/human_dcm_hcm_scportal_03.17.2022.h5ad", 
+        dest = "data/input/human_dcm_hcm_scportal_03.17.2022.h5seurat", 
+        overwrite = TRUE)
+
+DCM <- LoadH5Seurat("data/input/human_dcm_hcm_scportal_03.17.2022.h5seurat", 
+                    assays = "counts")
+
+Idents(DCM) <- "cell_type_leiden0.6"
+fb <- subset(DCM, idents = c("Activated_fibroblast", 
+                             "Fibroblast_II",
+                             "Fibroblast_I"))
+
+fb$percent.mt <- PercentageFeatureSet(fb, pattern = "^MT-")
+fb$sample <- fb$biosample_id
+
+DefaultAssay(fb) <- "RNA"
+
+fb <- SCTransform(fb, verbose = T, conserve.memory = T) %>% 
+  RunPCA(npcs = 30) %>% 
+  RunHarmony(group.by.vars = c("sample"), assay.use = "SCT") %>% 
+  RunUMAP(dims = 1:20, 
+          reduction = "harmony",
+          reduction.name = 'umap.rna.harmony', 
+          reduction.key = 'rna.harmony.UMAP_') %>% 
+  FindNeighbors(reduction = "harmony", dims = 1:20) %>% 
+  FindClusters(resolution = 0.5)
+
+saveRDS(fb, "data/output/human_dcm_hcm_scportal_03.17.2022_FB.RDS")
+```
+
+## import Reichart et al. (2022) Science
+https://cellxgene.cziscience.com/datasets
+Pathogenic variants damage cell composition and single cell transcription in cardiomyopathies
+DCM/ACM heart cell atlas: Fibroblasts schema_version 2.0.0
+Path : "data/input/FB_ACM_DCM_Reichart.rds"
+
+## import Heart atlas
+
+```{r}
+curl::curl_download(
+  url = "https://cellgeni.cog.sanger.ac.uk/heartcellatlas/data/hca_heart_fibroblasts_raw.h5ad", 
+  destfile = "data/input/hca_heart_fibroblasts_raw.h5ad"
+  )
+
+SeuratDisk::Convert("data/input/hca_heart_fibroblasts_raw.h5ad", 
+                    dest = "h5seurat", 
+                    overwrite = TRUE)
+file.remove("data/input/hca_heart_fibroblasts_raw.h5ad")
+```
+
+# import FB validation dataset GSE224959 
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE224959
+Path : "data/input/GSE224959/"
+
+```{r}
+# GSM5919340_5_CTRL_filtered_feature_bc_matrix
+# GSM5919341_6_CTRL_filtered_feature_bc_matrix
+# GSM5919342_10_CTRL_filtered_feature_bc_matrix
+# GSM5919343_11_CTRL_filtered_feature_bc_matrix
+# GSM5919344_12_CTRL_filtered_feature_bc_matrix
+# GSM5919345_1_MR_AF_filtered_feature_bc_matrix
+# GSM5919346_2_MR_AF_filtered_feature_bc_matrix
+# GSM5919347_3_MR_AF_filtered_feature_bc_matrix
+# GSM5919348_4_MR_AF_filtered_feature_bc_matrix
+# GSM5919349_7_MR_AF_filtered_feature_bc_matrix
+# GSM5919350_13_MR_AF_filtered_feature_bc_matrix
+# GSM5919351_14_MR_AF_filtered_feature_bc_matrix
+```
+
+

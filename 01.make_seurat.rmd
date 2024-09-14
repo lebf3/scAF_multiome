@@ -1,0 +1,226 @@
+---
+title: "Make_seurat"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(Signac)
+library(GenomeInfoDb)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggpubr)
+library(dplyr)
+```
+
+# create Seurat object
+**From Cellranger agrr output**
+## RNA
+
+```{r}
+# load data
+raw_input10x <- Read10X_h5(
+  "data/input/cellranger_out/filtered_feature_bc_matrix.h5"
+  )
+metadata <- read.csv(file = "data/input/cellranger_out/summary.csv",
+                     header = TRUE,
+                     row.names = 1)
+
+# extract RNA and ATAC counts
+rna_counts <- raw_input10x$`Gene Expression`
+atac_counts <- raw_input10x$Peaks
+
+# RNA Seurat object
+scAF <- CreateSeuratObject(counts = rna_counts)
+scAF$percent.mt <- PercentageFeatureSet(scAF, pattern = "^MT-")
+```
+
+## ATAC
+
+```{r}
+# add ATAC-seq data to Seurat object
+grange_counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+grange_use <- seqnames(grange_counts) %in% standardChromosomes(grange_counts)
+atac_counts <- atac_counts[as.vector(grange_use),]
+
+# load annotations
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+genome(annotations) <- "hg38"
+
+# change chromosome labels to match Cellranger
+seqlevels(annotations) <- paste0("chr", seqlevels(annotations))
+
+# create chromatin assay
+chrom_assay <- CreateChromatinAssay(
+  counts = atac_counts,
+  sep = c(":", "-"),
+  fragments = "data/input/atac_fragments.tsv.gz", 
+  min.cells = 10,
+  annotation = annotations
+)
+
+# create ATAC Seurat object
+s_peaks <- CreateSeuratObject(counts = chrom_assay,
+                              assay = "peaks",
+                              meta.data = scAF@meta.data)
+
+# compute nucleosome signal score per cell
+s_peaks <- NucleosomeSignal(object = s_peaks)
+
+# compute TSS enrichment score per cell
+s_peaks <- TSSEnrichment(object = s_peaks,
+                         fast = T,
+                         assay = "peaks")
+s_peaks$high.tss <- ifelse(s_peaks$TSS.enrichment > 2, 'High', 'Low')
+s_peaks$nucleosome_group <- ifelse(s_peaks$nucleosome_signal > 4, 
+                                   'NS > 4',
+                                   'NS < 4')
+
+# remove unnecessary objects
+rm(grange_counts, grange_use, atac_counts)
+gc()
+
+# add ATAC data to scAF object
+scAF[["ATAC"]] <- s_peaks@assays$peaks
+scAF@meta.data <- s_peaks@meta.data
+```
+
+# make metadata
+
+```{r}
+samples <- list.dirs("data/input/cellranger_out", full.names = F, recursive = F)
+
+meta <- data.frame(
+  sample = c("CF69", "CF77", "CF89", "CF91", "CF93", "CF94", "CF97", "CF102"),
+  condition = factor(c(1, 1, 1, 1, 0, 0, 0, 0)),
+  sex = factor(c("F", "M", "F", "M", "M", "F", "M", "M")),
+  age = c(51, 78, 69, 57, 80, 81, 58, 75)
+)
+
+
+summary <- rio::import(paste0("data/input/cellranger_out/", 
+                              samples[1], 
+                              "/summary.csv"))
+
+for (i in samples[2:length(samples)]) {
+  summary <- rbind(summary, rio::import(paste0("data/input/cellranger_out/",
+                                               i, 
+                                               "/summary.csv"))[1, ])
+}
+
+keep_cols <- c("Estimated number of cells",
+               "Linked genes",
+               "Linked peaks",
+               "GEX Sequenced read pairs",
+               "GEX Mean raw reads per cell",
+               "GEX Median genes per cell",
+               "GEX Median UMI counts per cell",
+               "ATAC Sequenced read pairs",
+               "ATAC Fraction of high-quality fragments in cells",
+               "ATAC Fraction of high-quality fragments overlapping TSS",
+               "ATAC Fraction of high-quality fragments overlapping peaks",
+               "ATAC Number of peaks",
+               "ATAC TSS enrichment score",
+               "ATAC Median high-quality fragments per cell")
+
+meta <- cbind(meta, summary[, keep_cols])
+meta$metadata_file <- paste0("data/input/cellranger_out/",
+                             meta$sample,
+                             "/per_barcode_metrics.csv")
+```
+
+# plot table of sample stats
+
+```{r}
+keep_cols <- c("condition",
+               "sex",
+               "age",
+               "Estimated number of cells",
+               "Linked genes",
+               "GEX Sequenced read pairs",
+               "GEX Median genes per cell")
+
+ggt_gex <- ggtexttable(meta[, keep_cols],
+                       rows = NULL,
+                       theme = ttheme("light",
+                                      colnames.style = colnames_style(
+                                        face = "italic",
+                                        size = 9,
+                                        fill = "white"
+                                      )))
+
+png("figs/make_seurat/Samples_QC_Metrics_table.png", 
+    units="in", 
+    bg = "transparent", 
+    width=15,
+    height=6, 
+    res=400)
+ggt_gex
+dev.off()
+```
+
+# pull other cellranger sample metrics
+
+```{r}
+# Process each sample
+l.meta <- lapply(1:8, function(x) {
+  
+  # Read the meta data for the current sample
+  meta_x <- read.csv(
+    file = meta$metadata_file[x],
+    header = TRUE,
+    row.names = 1
+  )
+  
+  # Change cell names to match cellranger aggregated output
+  keep <- grepl(paste0("-", x), row.names(scAF@meta.data))
+  cells.x <- row.names(scAF@meta.data)[keep]
+  row.names(meta_x) <- gsub("-1", paste0("-", x), row.names(meta_x))
+  meta_x <- meta_x %>% filter(row.names(.) %in% cells.x)
+  
+  # Add sample-specific information
+  meta_x <- meta_x %>%
+    mutate(sample = meta$sample[x],
+           condition = meta$condition[x],
+           sex = meta$sex[x])
+  
+  meta_x
+})
+meta_scaf <- do.call(rbind, l.meta)
+
+meta_scaf <- meta_scaf %>%
+  mutate(pct_reads_in_peaks = atac_peak_region_fragments / atac_fragments * 100)
+```
+
+# add QC metrics
+
+```{r}
+# keep meta from cells in aggregated data
+meta_scaf <- meta_scaf[colnames(scAF), ]
+scAF <- AddMetaData(scAF, meta_scaf[, c("sample",
+                                        "sex",
+                                        "condition",
+                                        "atac_peak_region_fragments",
+                                        "pct_reads_in_peaks")])
+```
+
+# normalize and save
+
+```{r}
+scAF <- NormalizeData(scAF,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000,
+                      verbose = FALSE)
+
+DefaultAssay(scAF) <- "ATAC"
+scAF <- FindTopFeatures(scAF, min.cutoff = 5)
+scAF <- RunTFIDF(scAF)
+
+saveRDS(scAF, "data/output/scAF.rds")
+```
+

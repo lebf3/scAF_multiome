@@ -1,0 +1,933 @@
+---
+title: "AF_CM_signature"
+author: "Francis Leblanc"
+date: '2022-09-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readxl)
+library(ggpubr)
+library(harmony)
+library(Seurat)
+library(Signac)
+library(cowplot)
+library(patchwork)
+library(dplyr)
+library(ggVennDiagram)
+
+sample_by_cond_colors_set <- c("#1CBCC4",
+                               "#85B0FA",
+                               "#1349A6", 
+                               "#041175",
+                               "#EF323C",
+                               "#AB151D",
+                               "#FB8086")
+
+sample_by_cond_colors_set_noMI <- c("#1CBCC4", 
+                                    "#85B0FA",
+                                    "#1349A6",
+                                    "#EF323C",
+                                    "#AB151D",
+                                    "#FB8086")
+
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA)
+    )
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+
+set.seed(2022)
+```
+
+# functions
+
+```{r}
+# process RNA assay
+process_seurat <- function(obj, 
+                           n_dims, 
+                           harmony_vars = "sample", 
+                           vars.regress = NULL,
+                           conserve.memory = T) {
+  NormalizeData(obj) %>% 
+    SCTransform(assay = "RNA", 
+                verbose = F, 
+                conserve.memory = F, 
+                vars.to.regress = vars.regress) %>% 
+    RunPCA(npcs = n_dims, assay = "SCT", reduction.name = "pca_new") %>% 
+    RunHarmony(group.by.vars = harmony_vars, 
+               assay.use = "SCT", 
+               reduction = "pca_new", 
+               reduction.save = "harmony.new") %>% 
+    RunUMAP(dims = 1:n_dims,
+            reduction = "harmony.new", 
+            reduction.name = "harmony.new.UMAP") %>% 
+    FindNeighbors(obj, 
+                  dims = 1:n_dims, 
+                  verbose = FALSE, 
+                  reduction = "harmony.new")
+}
+
+# compute TF motif activity and expression correlations 
+test_motif <- function(so = seurat_obj, signature = seurat_obj$AF.up) {
+  
+  # test accessibility
+  test <- psych::corr.test(as.matrix(signature), 
+                           t(as.matrix(so@assays$chromvar@data)),
+                           adjust = "fdr")
+  df_acc <- data.frame(R.acc = t(test$r), 
+                   P.acc = t(test$p), 
+                   FDR.acc = t(test$p.adj))
+  df_acc$motif <- row.names(df_acc)
+  df_acc$TF.var <- Signac::ConvertMotifID(so@assays$peaks2@motifs, 
+                                      id = row.names(df_acc)) %>%
+    toupper() # to retrieve gene counterpart in the RNA matrix
+  df_acc$TF <- gsub("(VAR.2)","", df_acc$TF.var, fixed = T) 
+  df_acc <- tidyr::separate_longer_delim(df_acc, TF, delim = "::")
+  
+  # test expression
+  test.tf <- unique(df_acc$TF[which(df_acc$TF %in% row.names(so))])
+  test <- psych::corr.test(as.matrix(signature),
+                           t(as.matrix(so@assays$RNA@data[test.tf, ])), 
+                           adjust = "fdr")
+  df_exp <- data.frame(R.exp = t(test$r), 
+                       P.exp = t(test$p), 
+                       FDR.exp = t(test$p.adj))
+  df_exp$TF <- row.names(df_exp)
+
+  # merge
+  df_m <- merge(df_acc, df_exp, all = T, by = "TF") %>% 
+    mutate(pass = FDR.exp < 0.01 & FDR.acc < 0.01,
+           R.product = abs(R.acc * R.exp))
+
+  # Add labels from top hits
+  df_m <- df_m %>% 
+    mutate(label = ifelse(TF %in% c('MXI1','NRF1','RORB','NFIC') & pass, TF, NA),
+           label = ifelse(TF %in% c("AR","NR3C2","NR3C1"), TF, label)) %>% 
+    arrange(desc(R.product)) 
+  
+  df_m$label[duplicated(df_m$label)] <- NA
+  df_m$pass[is.na(df_m$pass)] <- F
+
+  df_m
+} 
+```
+
+# Make robust AF signatures
+## venn diagram
+
+```{r}
+bulk_DEG <- rio::import("results/bulk_DEGs.csv")
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+
+# get genes enriched in CM
+markers <- presto::wilcoxauc(scAF, group_by = "WNN.sub.ct")
+markers_CM <- filter(markers, group == "CM" & auc > 0.5 & padj < 0.05)
+
+# get CTSN DEG
+ctsn_DEG <- bulk_DEG %>% 
+  filter(CTSN.Stranded_padj < 0.05 & 
+                  abs(CTSN.Stranded_L2FC) > 0.25 & 
+                  sign(J.Hsu_L2FC) == sign(CTSN.Stranded_L2FC)) %>% 
+  pull(external_gene_name) %>% 
+  unique()
+
+# get GSE69890 DEG
+hsu_DEG <- bulk_DEG %>% 
+  filter(J.Hsu_padj < 0.05 & 
+                  abs(J.Hsu_L2FC) > 0.25 &
+                  sign(J.Hsu_L2FC) == sign(CTSN.Stranded_L2FC)) %>%
+  pull(external_gene_name) %>% 
+  unique()
+
+l_DEG <- list(CTSN = ctsn_DEG, CM = markers_CM$feature, GSE69890 = hsu_DEG)
+
+# plot Venn
+venn <- Venn(l_DEG)
+d <- process_data(venn)
+ggplot() +
+  geom_sf(aes(fill = name), data = venn_region(d)) +
+  geom_sf_text(aes(label = name), 
+               data = venn_setlabel(d), 
+               nudge_x = c(100, 0, -100) , 
+               nudge_y = c(80, 0, 80)) +
+  geom_sf_text(aes(label = count), data = venn_region(d)) +
+  scale_fill_manual(values = c(rep("white", 4), "grey", rep("white", 2)))+
+  theme_void() +
+  NoLegend() +
+  geom_segment(aes(x = 500, y =  375, xend = 200, yend = 100), 
+               size= 1, 
+               arrow = arrow(length = unit(0.1, "in")) ,
+               lineend = "round", alpha=0.3) + 
+  geom_segment(aes(x = 500, y =  375, xend = 800, yend = 100), 
+               size= 1, 
+               arrow = arrow(length = unit(0.1, "in")) ,
+               lineend = "round", alpha=0.3)
+
+ggsave("figs/AF_CM_signature/venn.AF_signature.png", 
+       width = 2.5, 
+       height = 2.5)
+```
+
+## Sup. table signatures 
+
+```{r}
+robust <- bulk_DEG %>%
+  filter(CTSN.Stranded_padj < 0.05 & 
+                  J.Hsu_padj < 0.05 & 
+                  abs(J.Hsu_L2FC) > 0.25 & 
+                  abs(CTSN.Stranded_L2FC) > 0.25 &
+                  sign(J.Hsu_L2FC) == sign(CTSN.Stranded_L2FC) &
+                  external_gene_name %in% markers_CM$feature) %>% 
+  arrange(CTSN.Stranded_padj) %>% 
+  distinct(external_gene_name, .keep_all = T)
+
+robust_up <- filter(robust, CTSN.Stranded_L2FC > 0) %>% 
+  mutate(signature = "UP")
+
+robust_down <- filter(robust, CTSN.Stranded_L2FC < 0) %>% 
+  mutate(signature = "DOWN")
+
+pseudo_DEG <- readRDS("results/pseudobulk_DEG.rds") %>%
+  filter(celltype == "CM")
+
+signature_df <- rbind(robust_up, robust_down) %>% 
+  dplyr::select(gene_name, 
+                GENEID, 
+                CTSN.Stranded_L2FC,
+                CTSN.Stranded_padj, 
+                J.Hsu_L2FC, 
+                J.Hsu_padj, 
+                signature) %>% 
+  mutate(
+    CM_AUC = markers_CM$auc[match(gene_name, markers_CM$feature)],
+    CM_FDR = pseudo_DEG$padj[match(gene_name, row.names(pseudo_DEG))],
+    CM_L2FC = pseudo_DEG$log2FoldChange[match(gene_name, row.names(pseudo_DEG))]
+  )
+
+rio::export(signature_df, "results/signatures_genes.csv")
+```
+
+## Compute CM signature scores and plot violin
+
+```{r}
+CMC <- subset(scAF, WNN.sub.ct == "CM")
+DefaultAssay(CMC) <- "RNA"
+
+CMC <- AddModuleScore(CMC, 
+                      list(robust_up$external_gene_name, 
+                           robust_down$external_gene_name), 
+                      name = c("AF.up", "AF.down"))
+
+col_rename <- (ncol(CMC@meta.data)-1):ncol(CMC@meta.data)
+colnames(CMC@meta.data)[col_rename] <- c("AF.up", "AF.down")
+
+CMC$sample <- factor(CMC$sample, levels = levels(scAF$sample)[7:1])
+p1 <- VlnPlot(CMC, 
+              features = "AF.up",
+              group.by = "sample", 
+              cols = sample_by_cond_colors_set[7:1]) + 
+  NoLegend() +
+  ggtitle("AF signature UP") + 
+  xlab(NULL) + 
+  theme(axis.text.x = element_blank())
+
+p2 <- VlnPlot(CMC, 
+              features = "AF.down", 
+              group.by = "sample", 
+              cols = sample_by_cond_colors_set[7:1]) +
+  NoLegend() + 
+  ggtitle("AF signature DOWN") +
+  xlab(NULL)
+
+p1/p2
+ggsave("figs/AF_CM_signature/vlnplot_AF_signature.png", width = 3, height = 6)
+```
+
+# CM sub-clusters
+
+## show UMAP sub-CM clusters, samples, marker genes
+
+```{r}
+CMC <- process_seurat(CMC, 10, vars.regress = "percent.mt")
+DefaultAssay(CMC) <- "SCT"
+CMC <- FindClusters(CMC, resolution = 0.05)
+
+# clusters
+p1 <- DimPlot(CMC, reduction = "harmony.new.UMAP") + 
+  NoAxes() + 
+  ggtitle("CM sub-clusters") +
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.3, top = 0.25) 
+
+# samples
+CMC$sample <- factor(CMC$sample, levels = levels(scAF$sample))
+
+p2 <- DimPlot(CMC, 
+              reduction = "harmony.new.UMAP", 
+              group.by = "sample", 
+              cols = sample_by_cond_colors_set) + 
+  NoAxes() + 
+  labs(color = "sample") + 
+  ggtitle(NULL) +
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.3, top = 0.25)
+
+markers <- presto:::wilcoxauc.Seurat(X = CMC,
+                                     assay = 'data',
+                                     seurat_assay = 'RNA') %>% 
+  group_by(group) %>%
+  slice_max(auc, n = 6)
+
+dp <- DotPlot(CMC, 
+              assay = "RNA",
+              features = markers$feature, 
+              group.by = "seurat_clusters", 
+              dot.min = 0.4) + 
+  ylab("CM sub-clusters") + 
+  xlab(NULL) +
+  theme(legend.position = "top", 
+        legend.box="vertical",
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+DefaultAssay(CMC) <-"RNA"
+
+# sample proportions by cluster
+p.b <- ggplot(CMC@meta.data, aes(y = seurat_clusters, fill = sample)) + 
+  geom_bar(position="fill") +
+  xlab("Proportion") + 
+  ylab("CM sub-clusters") +
+  scale_fill_manual(values = sample_by_cond_colors_set) 
+
+p1 + dp + p.b + p2 + plot_spacer() + plot_spacer() + plot_layout(ncol = 3)
+
+ggsave("figs/AF_CM_signature/CM_sub_clusters.png",
+       width = 14,
+       height = 9)
+```
+
+# AF signature motif association 
+## Show outlier CF91 effect on results
+
+```{r}
+# run on CM metacells 
+meta_c <- readRDS("data/output/metacells/MetaCells_snAF.rds") 
+
+meta_c@meta.data[, c("sex", "rhythm")] <- 
+  scAF@meta.data[match(meta_c$sample, scAF@meta.data$sample), c("sex", "rhythm")] 
+seurat_obj <- subset(meta_c, subset = cell_type == "CM")
+
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- AddModuleScore(seurat_obj, 
+                             list(robust_up$external_gene_name, 
+                                  robust_down$external_gene_name),
+                             name = c("AF.up", "AF.down")) 
+
+col_rename <- (ncol(seurat_obj@meta.data)-1):ncol(seurat_obj@meta.data)
+colnames(seurat_obj@meta.data)[col_rename] <- c("AF.up", "AF.down") 
+
+# test correlations
+glm_res_up <- test_motif(signature = seurat_obj$AF.up) 
+glm_res_down <- test_motif(signature = seurat_obj$AF.down)
+
+# check correlations strongest hit in all samples
+seurat_obj$sample <- factor(seurat_obj$sample, levels(scAF$sample)[7:1]) 
+
+df <- data.frame(gene = seurat_obj@assays$RNA@data["NR3C2",],
+                 motif = seurat_obj@assays$chromvar@data["MA0727.1",],
+                 AF.up = seurat_obj$AF.up,
+                 sample = seurat_obj$sample)
+
+p1 <- ggscatter(df, 
+                x = "AF.up",
+                y = "motif",
+                fill = "sample",
+                ylab = "NR3C2 motif score",
+                shape = 21,
+                add = "reg.line",
+                size = 2,
+                xlab = "AF signature",
+                cor.coef = T,
+                cor.method = "spearman")  +
+  NoLegend() +
+  scale_fill_manual(values = sample_by_cond_colors_set[7:1])
+
+p2 <- ggscatter(df,
+                x = "AF.up",
+                y = "gene",
+                fill = "sample",
+                ylab = "NR3C2 expression",
+                shape = 21,
+                add = "reg.line",
+                size = 2,
+                xlab = "AF signature",
+                cor.coef = T,
+                cor.method = "spearman",
+                cor.coef.coord = c(-0.07, 0.8)) +
+  theme(legend.position = "right") +
+  scale_fill_manual(values = sample_by_cond_colors_set[7:1])
+
+p1 | p2
+ggsave("figs/AF_CM_signature/NR3C2_meta_CM.png", width = 7, height = 3)
+```
+
+## Show MI signature in CM
+
+```{r}
+TS10_3 <- read_xlsx("data/input/NRC/41586_2022_5060_MOESM15_ESM_TS10_MI.xlsx",
+                  sheet = 3)
+TS10_2 <- read_xlsx("data/input/NRC/41586_2022_5060_MOESM15_ESM_TS10_MI.xlsx",
+                  sheet = 2)
+TS10_1 <- read_xlsx("data/input/NRC/41586_2022_5060_MOESM15_ESM_TS10_MI.xlsx",
+                  sheet = 1)
+
+CMC <- AddModuleScore(CMC, 
+                      list(TS10_1$gene,
+                           TS10_2$gene,
+                           TS10_3$gene),
+                      name = c("vCM1","vCM2","vCM3"))
+col_rename <- (ncol(CMC@meta.data)-2):ncol(CMC@meta.data)
+
+colnames(CMC@meta.data)[col_rename] <- c("vCM1",
+                                         "vCM2 (pre-stressed)",
+                                         "vCM3 (stressed)")
+VlnPlot(CMC,
+  group.by = "sample",
+  features = c("vCM1", "vCM2 (pre-stressed)", "vCM3 (stressed)")) &
+  ylab("Marker genes scores") &
+  xlab("Samples") &
+  scale_fill_manual(values = sample_by_cond_colors_set[7:1])
+ggsave("figs/AF_CM_signature/MI_signatures.png", width = 12, height = 4)
+```
+
+## Re-test after removal of outlier CF91 
+
+```{r}
+seurat_obj <- subset(seurat_obj, subset = sample != "CF91")
+glm_res_up <- test_motif(signature = seurat_obj$AF.up) 
+glm_res_down <- test_motif(signature = seurat_obj$AF.down)
+
+## save table
+glm_res_up$AF_signature <- "UP"
+glm_res_down$AF_signature <- "DOWN"
+res <- rbind(glm_res_up, glm_res_down)
+
+rio::export(res, "results/CM_Motifs_cors.csv")
+```
+
+## plot ranks and correlations
+
+```{r}
+plot_rank_cor <- function(signature) {
+  
+  if (signature == "UP") {
+    s <- 1
+    cord <- c(0.8,0.8)
+    } 
+  else{
+    s <- -1
+    cord <- c(0.8,0.1)
+    }
+  
+  # rank plot
+  res.s <- res %>% 
+    filter(AF_signature == signature) %>% 
+    arrange(desc(R.acc))
+  res.s$rank <- seq(1:nrow(res.s))
+  res.s$label.r <- ifelse(res.s$TF %in% c("AR","NR3C2","NR3C1"), res.s$TF, NA)
+  
+  p <- ggplot(res.s, aes(x = R.acc, y = rank, label = label.r)) + 
+    geom_point() + 
+    ggrepel::geom_label_repel(min.segment.length = 0.01,
+                              alpha = 0.7, 
+                              nudge_y = 200 * s,
+                              nudge_x = -0.1 * s) +
+    xlab(NULL) + 
+    ylab("Rank") + 
+    xlim(range(res.s$R.acc))
+  
+  
+  # scatter cors
+  p1 <- ggplot(res.s, aes(x = R.acc, y = R.exp, label = label)) +
+    geom_vline(xintercept = 0) +
+    geom_hline(yintercept = 0) +
+    geom_point(aes(color = pass, size = pass)) +
+    theme_cowplot() +
+    scale_color_manual(values = c("black", "darkred")) +
+    scale_size_manual(values = c(0.5, 2)) +
+    theme(line = element_blank(),
+      panel.grid.major = element_line(color = "lightgrey"),
+      legend.position = cord) +
+    ggrepel::geom_label_repel(min.segment.length = 0.01,
+                              max.overlaps = 30,
+                              alpha = 0.7,
+                              nudge_y = 0.1) +
+    xlab("Motif Pearson R") +
+    ylab("TF Pearson R") +
+    labs(color = "Significant\nin both") +
+    xlim(range(res.s$R.acc))
+  
+  p + p1 + plot_layout(nrow = 2, heights = c(1, 3))
+}
+
+plot_rank_cor(signature = "UP")
+ggsave("figs/AF_CM_signature/CM_AF_up_cors.png", width = 5, height = 6)
+
+plot_rank_cor(signature = "DOWN")
+ggsave("figs/AF_CM_signature/CM_AF_down_cors.png", width = 5, height = 6)
+```
+
+## plot correlation with signature
+
+```{r}
+seurat_obj$sample <- factor(seurat_obj$sample, levels = c("CF102", 
+                                                          "CF97",
+                                                          "CF93", 
+                                                          "CF89", 
+                                                          "CF77",
+                                                          "CF69"))
+
+AR_df <- data.frame(gene = seurat_obj@assays$RNA@data["AR", ],
+                 motif = seurat_obj@assays$chromvar@data["MA0007.3", ],
+                 AF.up = seurat_obj$AF.up,
+                 sample = seurat_obj$sample)
+
+p1 <- ggscatter(AR_df, 
+                x = "AF.up",
+                y = "motif",
+                fill = "sample",
+                ylab = "AR motif score",
+                shape = 21,
+                add = "reg.line",
+                size = 2,
+                xlab = "AF signature",
+                cor.coef = T,
+                cor.method = "pearson") +
+  NoLegend() +
+  scale_fill_manual(values = sample_by_cond_colors_set_noMI[6:1])
+
+p2 <- ggscatter(AR_df,
+                x = "AF.up",
+                y = "gene",
+                fill = "sample",
+                ylab = "AR expression",
+                shape = 21,
+                add = "reg.line",
+                size = 2,
+                xlab = "AF signature",
+                cor.coef = T,
+                cor.method = "pearson",
+                cor.coef.coord = c(-0.07, 0.8)) +
+  theme(legend.position = "right") + ylim(0.1, 0.9) +
+  scale_fill_manual(values = sample_by_cond_colors_set_noMI[6:1])
+
+p3 <- ggscatter(AR_df,
+                x = "motif",
+                y = "gene",
+                fill = "sample",
+                ylab = "AR expression",
+                shape = 21,
+                add = "reg.line",
+                size = 2,
+                xlab = "AR motif score",
+                cor.coef = T,
+                cor.method = "pearson",
+                cor.coef.coord = c(-2, 0.8)) +
+  scale_fill_manual(values = sample_by_cond_colors_set_noMI[6:1]) +
+  NoLegend() + ylim(0.1, 0.9)
+
+p1 / p2 / p3
+
+ggsave("figs/AF_CM_signature/AR_meta_CM.png", width = 4, height = 6)
+```
+
+# AR & Sex 
+## scAF AR accessibility by sex
+
+```{r}
+VlnPlot(CMC,
+        assay = "chromvar",
+        features = "MA0007.3",
+        group.by = "rhythm",
+        split.by = "sex",
+        pt.size = 0.1) +
+  ggtitle("AR motif (MA0007.3)") +
+  ylab("Motif accessibility") +
+  xlab("Rhythm")
+ggsave("figs/AF_CM_signature/AR_motif_sex.png", width = 4, height = 4)
+```
+
+## bulk boxplots AR counts ~ Rhythm + Sex
+
+```{r}
+bulk.LAA.expr <- readRDS("data/output/CTSN_J.Hsu_norm_counts.rds")
+
+coldat.LAA <- as.data.frame(readRDS("data/output/CTSN_J.Hsu_coldata.rds"))
+coldat.LAA$AR <- bulk.LAA.expr[c("AR"), ] 
+coldat.LAA$rhythm <- gsub("Ctl","CTL", coldat.LAA$rhythm)
+
+p <- coldat.LAA %>%
+  dplyr::filter(rhythm %in% c("AF", "CTL") &
+                  dataset == "CTSN") %>%
+  mutate(rhythm = recode(rhythm, CTL = "SR")) %>%
+  ggplot(aes(y = AR, x = rhythm, fill = rhythm)) +
+  geom_jitter() +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = c("darkred", "blue")) +
+  NoLegend() +
+  ylab("AR normalized counts") +
+  ggtitle("CTSN")
+p1 <- facet(p, facet.by = c("sex")) 
+p_ctsn <- p1 + ggpubr::stat_compare_means(label = "p.format")
+
+p <- coldat.LAA %>%
+  dplyr::filter(rhythm %in% c("AF", "CTL") &
+                  dataset == "J.Hsu") %>%
+  mutate(rhythm = recode(rhythm, CTL = "SR")) %>%
+  ggplot(aes(y = AR, x = rhythm, fill = rhythm)) +
+  geom_jitter() +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = c("darkred", "blue")) +
+  NoLegend() +
+  ylab("AR normalized counts") +
+  ggtitle("GSE69890")
+p1 <- facet(p, facet.by = c("sex")) 
+p_J.Hsu <- p1 + ggpubr::stat_compare_means(label = "p.format")
+
+p <- coldat.LAA %>%
+  dplyr::filter(rhythm %in% c("AF", "CTL") &
+                  dataset == "CTSN") %>%
+  mutate(rhythm = recode(rhythm, CTL = "SR")) %>%
+  ggplot(aes(y = AR, x = sex)) +
+  geom_jitter() +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  NoLegend() +
+  ylab("AR normalized counts") +
+  ggtitle("CTSN")
+p_ctsn_s <- p + ggpubr::stat_compare_means(label = "p.format")
+
+p <- coldat.LAA %>%
+  dplyr::filter(rhythm %in% c("AF", "CTL") &
+                  dataset == "J.Hsu") %>%
+  mutate(rhythm = recode(rhythm, CTL = "SR")) %>%
+  ggplot(aes(y = AR, x = sex)) +
+  geom_jitter() +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  NoLegend() +
+  ylab("AR normalized counts") +
+  ggtitle("GSE69890")
+p_J.Hsu_s <- p + ggpubr::stat_compare_means(label = "p.format")
+
+
+p_ctsn | p_J.Hsu | p_ctsn_s | p_J.Hsu_s
+ggsave("figs/AF_CM_signature/AR_bulk_sex.png", width = 12, height = 4)
+```
+
+# AR footprint
+
+```{r}
+scAF <- Footprint(
+  object = scAF,
+  assay = "peaks2",
+  motif.name = c("Ar"),
+  genome = BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+  )
+
+DefaultAssay(scAF) <- "peaks2"
+
+keep_ct <- c("PC", "CM", "EC", "FB", "Myeloid", "Endocardial", "Mesothelial")
+Idents(scAF) <- "WNN.sub.ct"
+p1 <- PlotFootprint(scAF, 
+                    features = c("Ar"), 
+                    group.by = "rhythm", 
+                    normalization = "subtract", 
+                    show.expected = F) + 
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank()) + 
+  ggtitle("AR motif")+ 
+  scale_color_manual(values = c("#EF323C","#1349A6"))
+                                                                                                                         
+p2 <- PlotFootprint(scAF, 
+                    features = c("Ar"), 
+                    group.by = "WNN.sub.ct", 
+                    idents = keep_ct, 
+                    normalization = "subtract", 
+                    show.expected = F, 
+                    label.top = 1) + 
+  ggtitle(NULL) 
+p1/p2 
+ggsave("figs/AF_CM_signature/AR_footprint.png", width = 5, height = 4)
+
+PlotFootprint(scAF, 
+              features = c("Ar"),
+              group.by = "WNN.sub.ct", 
+              normalization = "subtract", 
+              show.expected = F, 
+              label.top = 0, 
+              split.by = "WNN.sub.ct") + 
+  ggtitle(NULL) & 
+  NoLegend()
+
+ggsave("figs/AF_CM_signature/AR_footprint_split.png", width = 12, height = 9) 
+```
+
+# Score other datasets CM with AF signature 
+## plot Violin of scores
+
+```{r}
+metacell_A_LAA_MI <- readRDS("data/output/metacells/metacells_A_LAA_MI.rds")
+metacell_A_LAA_MI <- NormalizeData(metacell_A_LAA_MI)
+
+# adjusting group labels
+metacell_A_LAA_MI$cond_label <- as.character(metacell_A_LAA_MI$disease) 
+
+metacell_A_LAA_MI$cond_label <- ifelse(
+  metacell_A_LAA_MI$dataset == "Atria_H.atlas",
+  metacell_A_LAA_MI$major_labl,
+  metacell_A_LAA_MI$cond_label
+)
+
+metacell_A_LAA_MI$cond_label <- ifelse(
+  metacell_A_LAA_MI$cond_label == "CTRL",
+  paste0(metacell_A_LAA_MI$cond_label, "_", metacell_A_LAA_MI$dataset),
+  metacell_A_LAA_MI$cond_label
+)
+
+metacell_A_LAA_MI$cond_label <- gsub("CTRL_ACM_DCM", 
+                                     "CTRL_A/D",
+                                     metacell_A_LAA_MI$cond_label)
+
+metacell_A_LAA_MI$cond_label <- factor(metacell_A_LAA_MI$cond_label, 
+                                       levels = c("AF",
+                                                  "SR",
+                                                  "LA",
+                                                  "RA",
+                                                  "CTRL_MI",
+                                                  "IZ",
+                                                  "FZ",
+                                                  "BZ",
+                                                  "RZ",
+                                                  "CTRL_A/D",
+                                                  "DCM",
+                                                  "ACM",
+                                                  "NCM"))
+
+# compute signature scores and plot violin
+metacell_A_LAA_MI <- AddModuleScore(metacell_A_LAA_MI, 
+                                    list(robust_up$external_gene_name, 
+                                         robust_down$external_gene_name), 
+                                    name = c("AF.up", "AF.down"))
+
+col_rename <- (ncol(metacell_A_LAA_MI@meta.data)-1):
+  ncol(metacell_A_LAA_MI@meta.data)
+colnames(metacell_A_LAA_MI@meta.data)[col_rename] <- c("AF.up", "AF.down")
+
+metacell_A_LAA_MI$dataset2 <- metacell_A_LAA_MI$dataset
+metacell_A_LAA_MI$dataset2[metacell_A_LAA_MI$dataset2 == "LAA_AF"] <- "scAF"
+
+p1 <- VlnPlot(metacell_A_LAA_MI,
+              features = c("AF.up"),
+              group.by = "cond_label", 
+              assay = "RNA", 
+              split.by = "dataset2") + 
+  ggtitle(NULL) +
+  xlab(NULL) + 
+  ylab("AF signature UP") + 
+  theme(axis.text.x = element_blank(),
+        legend.position = c(.1,1), 
+        legend.direction = "horizontal") + 
+  labs(fill = "Dataset") 
+
+p2 <- VlnPlot(metacell_A_LAA_MI,
+              features = c("AF.down"), 
+              group.by = "cond_label", 
+              assay = "RNA",
+              split.by = "dataset2") + 
+  ggtitle(NULL) + 
+  ylab("AF signature DOWN") + 
+  NoLegend() + 
+  xlab("Disease state/heart chamber")
+
+p1/p2
+ggsave("figs/AF_CM_signature/vlnplot_AF_signatures_metacell_A_LAA_MI.png",
+       width = 7,
+       height = 6)
+```
+
+## dataset composition
+
+```{r}
+bp.s <- metacell_A_LAA_MI@meta.data %>%
+  distinct(sample, .keep_all = T) %>%
+  group_by(dataset2) %>%
+  count() %>%
+  ggplot(aes(y = dataset2, x = n, label = n)) +
+  geom_col() +
+  geom_text(hjust = -0.5) +
+  xlab("Sample count") + 
+  ylab("Dataset") + 
+  xlim(0, 80)
+ggsave(plot = bp.s, 
+       "figs/AF_CM_signature/sample_counts.png", 
+       width = 5, 
+       height = 6)
+```
+
+## plot scatter of signature scores
+
+```{r}
+metacell_A_LAA_MI$rhythm[is.na(metacell_A_LAA_MI$rhythm)] <- "unknown"
+metacell_A_LAA_MI$rhythm <- factor(metacell_A_LAA_MI$rhythm, 
+                                   levels = c("unknown", "SR", "AF"))
+metacell_A_LAA_MI$MI <- ifelse(metacell_A_LAA_MI$sample == "CF91", 
+                               "CF91", 
+                               "Other")
+
+p <- arrange(metacell_A_LAA_MI@meta.data, rhythm) %>% 
+  ggplot(aes(AF.up, AF.down, color = rhythm, alpha = rhythm, shape = MI)) +
+  geom_point() +
+  labs(x = "AF signature UP", y = "AF signature DOWN") +
+  scale_alpha_manual(values = c(0.2, 1, 1)) +
+  scale_shape_manual(values = c(1, 16)) +
+  scale_color_manual(values = c("darkgrey", "#1349A6", "#EF323C")) +
+  theme(legend.position = c(.7, .7)) 
+  
+  
+ggExtra::ggMarginal(p, groupFill = T)
+ggsave("figs/AF_CM_signature/statter_margin_AF_modules_metacells_A_LAA_MI.png",
+       width = 5, 
+       height = 5)
+```
+
+## Show top CM and AF specific genes
+
+```{r}
+ct_markers <- presto::wilcoxauc(scAF, group_by = "WNN.sub.ct") %>% 
+  filter(group == "CM")
+
+markers_AF <- presto::wilcoxauc(metacell_A_LAA_MI, group_by = "cond_label") %>% 
+  filter(group == "AF" & feature %in% c(robust_up$external_gene_name))
+
+markers_AF <- markers_AF %>% 
+  mutate(auc.ct = ct_markers$auc[match(feature, ct_markers$feature)],
+         auc.ct.af = auc * auc.ct) %>% 
+  arrange(auc.ct.af)
+
+rio::export(markers_AF, "results/AFup_markers_specificity.csv") 
+
+markers_AF$rank <- 1:nrow(markers_AF)
+markers_AF$label <- ifelse(markers_AF$rank > 56, markers_AF$feature, NA)
+
+l.p <- VlnPlot(metacell_A_LAA_MI,
+               markers_AF$label[order(markers_AF$rank, decreasing = T)] ,
+               group.by = "cond_label",
+               pt.size = 0,
+               combine = F,
+               split.by = "dataset2") 
+
+# remove axes labels where not needed
+l.p[1:4] <- lapply(l.p[1:4], function(x) {
+  x + 
+    ylab(NULL) + 
+    xlab(NULL) + 
+    theme(axis.text.x = element_blank()) +
+    NoLegend()
+})
+
+l.p[5:6] <- lapply(l.p[5:6], function(x) {
+    x + 
+    ylab(NULL) + 
+    xlab("Disease state/heart chamber") + 
+    NoLegend()
+})
+
+l.p[[3]] <- l.p[[3]] + ylab("Normalized expression")
+
+l.p <- lapply(l.p, function(x){
+    x + theme(plot.title = element_text(size = 10, face = "bold"))
+  })
+
+l.p[[1]] <- l.p[[1]] + 
+  theme(legend.position = "top") + 
+  labs(fill = "Dataset")
+
+wrap_plots(l.p , ncol = 2)
+ggsave("figs/AF_CM_signature/top_up_markers.png",
+       width = 7,
+       height = 5)
+```
+
+# Validate CM gene signature with CM from Litvinukova2020 LA
+
+```{r}
+hca_LA <- readRDS("data/output/Litvinukova2020_LA.RDS") 
+
+markers_CMc <- presto:::wilcoxauc.Seurat(X = hca_LA,
+                                             group_by = "cell_type",
+                                             assay = "data",
+                                             seurat_assay = "RNA") %>% 
+  filter(group == "cmc" & auc > 0.5 & padj < 0.05)
+
+robust_up2 <- robust %>% 
+  filter(external_gene_name %in% markers_CMc$feature & CTSN.Stranded_L2FC > 0)
+robust_down2 <- robust %>% 
+  filter(external_gene_name %in% markers_CMc$feature & CTSN.Stranded_L2FC < 0)
+
+metacell_A_LAA_MI <- AddModuleScore(metacell_A_LAA_MI, 
+                                    list(robust_up2$external_gene_name, 
+                                         robust_down2$external_gene_name), 
+                                    name = c("AF.up2", "AF.down2"))
+col_rename <- (ncol(metacell_A_LAA_MI@meta.data)-1):
+  ncol(metacell_A_LAA_MI@meta.data)
+
+colnames(metacell_A_LAA_MI@meta.data)[col_rename] <- c("AF.up2", "AF.down2")
+
+# plot scatter of signature scores
+df <- arrange(metacell_A_LAA_MI@meta.data, rhythm)
+
+p <- ggplot(df, 
+            aes(AF.up2, AF.down2, color = rhythm, alpha = rhythm, shape = MI)) + 
+  geom_point() + 
+  labs(x = "AF signature UP", y = "AF signature DOWN") + 
+  scale_alpha_manual(values = c(0.2, 1, 1)) +
+  scale_shape_manual(values = c(1, 16)) +
+  scale_color_manual(values = c("darkgrey", "#1349A6", "#EF323C")) +
+  theme(legend.position = c(.7, .7)) 
+  
+ggExtra::ggMarginal(p, groupFill = T) 
+ggsave("figs/AF_CM_signature/signature_metacells_validation.png",
+       width = 5, 
+       height = 5)
+
+# plot correlations of signature scores
+p2 <- ggscatter(df,
+                x = "AF.up2",
+                y = "AF.up",
+                cor.coef = T,
+                ylab = "scAF",
+                xlab = "H.atlas",
+                title = "Signature UP")
+p3 <- ggscatter(df,
+                x = "AF.down2",
+                y = "AF.down",
+                cor.coef = T,
+                ylab = "scAF",
+                xlab = "H.atlas",
+                title = "Signature DOWN")
+p2 | p3
+ggsave("figs/AF_CM_signature/Signatures_correlations.png", 
+       width = 10, 
+       height = 5)
+```

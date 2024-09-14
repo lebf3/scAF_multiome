@@ -1,0 +1,308 @@
+---
+title: "peaks_summary_stats"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(cowplot)
+library(Signac)
+library(GenomicRanges)
+library(patchwork)
+library(ggsci)
+library(ggridges)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+theme_set(theme_cowplot())
+
+small_legend <- theme(legend.title = element_text(size = 10),
+                      legend.key.size = unit(0.2, "in"),
+                      legend.text = element_text(size = 10)) 
+```
+
+
+# Compute peaks summary stats
+
+## Label peaks with Encode cCREs
+
+### Load peaks called in each cell-type
+
+```{r}
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+
+# MACS2 peak calls by cell-types
+peaks <- readRDS("data/output/scAF.ct.peaks.rds") 
+peaks$peak <- GRangesToString(peaks)
+
+# label peaks called by cell-type
+meta <- scAF@assays$peaks2@meta.features
+meta$peak_called_in <- peaks@elementMetadata$peak_called_in[
+  match(row.names(meta), peaks$peak)
+  ]
+
+ct <- levels(scAF$WNN.sub.ct)
+
+# make boolean columns for peaks called by cell-types
+peak_called_in <- sapply(ct, function(x) {
+  grepl(x, meta$peak_called_in)
+}) %>% 
+  as.data.frame() 
+
+colnames(peak_called_in) <- ct
+meta <- cbind(meta, peak_called_in)
+```
+
+### Find overlapping ENCODE peaks 
+
+```{r}
+# look at the characteristics of peaks by Encode type
+encode_ccre <- rio::import("data/input/encodeCcreCombined.txt")
+encode_ccre_gr <- GRanges(seqnames = encode_ccre[, "#chrom"],
+                          IRanges(start = encode_ccre$chromStart,
+                                  end = encode_ccre$chromEnd))
+
+encode_ccre_gr@elementMetadata <- DataFrame(encode_ccre[, -c(1:3)])
+
+# label peak types by their overlap with cCREs
+# peak info as Grange
+peaks_gr <- scAF@assays$peaks2@ranges
+peaks_gr$peak <- GRangesToString(peaks_gr)
+keep_cols <- c("GC.percent",
+               "sequence.length",
+               "count",
+               "percentile",
+               "peak_called_in")
+
+peaks_gr@elementMetadata <- cbind(peaks_gr@elementMetadata, 
+                                  meta[, c(keep_cols)])
+
+# get overlap
+ovelaping_peaks <- findOverlaps(peaks_gr, encode_ccre_gr)
+peaks_gr_ol <- peaks_gr[ovelaping_peaks@from]
+
+# add annotation from cCRE
+peaks_gr_ol@elementMetadata <- cbind(
+  peaks_gr_ol@elementMetadata, 
+  encode_ccre_gr@elementMetadata[ovelaping_peaks@to,]
+)
+
+# make Boolean columns for cCRE types
+peaks_ccre_labels <- peaks_gr_ol@elementMetadata %>% 
+  as.data.frame() %>% 
+  group_by(peak) %>% 
+  summarize_at(.vars = "ucscLabel", paste, collapse=",")
+
+ucscLabel <- c("enhP", "enhD", "prom", "CTCF", "K4m3") 
+peaks_ucscLabel_df <- sapply(ucscLabel, function(x){
+  grepl(x, peaks_ccre_labels$ucscLabel)
+}) %>% 
+  as.data.frame()
+
+row.names(peaks_ucscLabel_df) <- peaks_ccre_labels$peak
+
+# label peaks not found in Encode
+peaks_ucscLabel_df$Not.Encode <- F
+peaks_gr_novel <- peaks_gr[-ovelaping_peaks@from]
+peaks_gr_novel@elementMetadata[, ucscLabel] <- F 
+peaks_gr_novel$Not.Encode <- T
+peaks_novel_df <- peaks_gr_novel@elementMetadata[, c(ucscLabel, 
+                                                     "Not.Encode")] %>%
+  as.data.frame()
+row.names(peaks_novel_df) <- peaks_gr_novel$peak
+peaks_ucscLabel_df <- rbind(peaks_ucscLabel_df, peaks_novel_df)
+
+# Now we have Encode cCRE types for each overlapping peak 
+# and the 'Not.Encode' column for the peaks not overlapping Encode cCREs
+meta <- cbind(meta, peaks_ucscLabel_df[row.names(meta), ])
+saveRDS(meta, "data/output/peaks.meta.encode.labels.rds")
+```
+
+
+## plot statistics by cCRE type
+plot density for counts, lengths, GC
+
+```{r}
+## Densities by peak type
+meta$cell_type_count <- meta[, ct[-grep("Mast", ct)]] %>% 
+  as.data.frame() %>% 
+  rowSums() %>% 
+  factor(levels = 1:11)
+
+meta_stats <- meta %>% 
+  select(GC.percent:percentile, cell_type_count,enhP:Not.Encode) %>% 
+  mutate(peak = row.names(.)) %>% 
+  tidyr::pivot_longer(cols = enhP:Not.Encode, names_to = "ucscLabel") %>% 
+  filter(value == T)
+
+meta_stats$ucscLabel <- factor(meta_stats$ucscLabel, 
+                               levels = c("prom", 
+                                          "enhP", 
+                                          "K4m3", 
+                                          "enhD", 
+                                          "CTCF", 
+                                          "Not.Encode"))
+
+plot_ridges <- function(col_to_plot) {
+  col_to_plot <- ensym(col_to_plot)
+  ggplot(meta_stats, aes(x = !!col_to_plot, y = ucscLabel, fill = ucscLabel)) + 
+  stat_density_ridges(quantile_lines = TRUE,
+                      quantiles = 2,
+                      scale = 2,
+                      alpha = 0.7
+  ) + 
+  NoLegend() + 
+  scale_fill_nejm()
+}
+
+p1 <- plot_ridges(count) +
+  scale_x_log10()
+
+p2 <- plot_ridges(GC.percent) +
+  ylab(NULL) + 
+  theme(axis.text.y = element_blank()) 
+
+p3 <- plot_ridges(sequence.length) +
+  scale_x_log10()+
+  ylab(NULL) + 
+  theme(axis.text.y = element_blank()) 
+
+p1 + p2 + p3
+ggsave(
+  "figs/peaks_summary_stats/density_peak.types_ridges.png",
+  height = 4,
+  width = 10
+)
+
+# barplots by peak type
+p1 <- ggplot(meta_stats, aes(x = cell_type_count, fill = ucscLabel)) + 
+  geom_bar(position = "fill") + 
+  ylab("Fraction of peaks") + 
+  xlab("Cell-type count per peak")
+
+p2 <- ggplot(meta_stats, aes(x = cell_type_count)) + 
+  geom_bar() + 
+  ylab("Peak count")  + 
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+p2 + p1 + plot_layout(nrow = 2, heights = c(1.2, 3))
+ggsave(
+  "figs/peaks_summary_stats/Barplot_peak.types_v.png",
+  height = 6,
+  width = 5
+)
+```
+
+# CATlas overlap 
+
+## find the number of cell-type specific peaks overlap with Catlas by cell-type
+
+```{r}
+# import Catlas cCRE data
+ccre_path <- "data/input/Catlas/"
+ccre <- rtracklayer::import(paste0(ccre_path, "cCREs.bed.gz"))
+
+# All cell combined peaks with celltype attribution (sparse matrix format)
+mm <- as.matrix(Matrix::readMM(paste0(ccre_path, "matrix.tsv.gz")))
+colnames(mm) <- read.table(paste0(ccre_path, "celltypes.txt.gz"),
+                           header = F,
+                           sep = ":")[, 1]
+ccre@elementMetadata <- cbind(ccre@elementMetadata, mm)
+
+## make a heatmap by cell-type
+# keep peaks only found in 1 cell-type
+keep <- which(meta$cell_type_count == 1)
+peaks_gr_specific <- peaks_gr[keep]
+specific_ccre_ol <- findOverlaps(peaks_gr_specific, ccre)
+
+# merge with CATlas ccre info
+peaks_gr_specific_combined <- peaks_gr_specific[specific_ccre_ol@from]
+peaks_gr_specific_combined@elementMetadata[, colnames(mm)] <-
+  ccre[specific_ccre_ol@to]@elementMetadata
+
+# count percentage of cell-type peak overlaping with each CATlas cell-type
+peaks_df_specific_combined <- peaks_gr_specific_combined@elementMetadata %>% 
+  as.data.frame() %>% 
+  pivot_longer(cols = Follicular:Fetal.Excitatory.Neuron.2,
+               names_to = "Catlas") 
+
+ct_peaks_counts <- peaks_df_specific_combined %>% 
+  group_by(peak_called_in, Catlas) %>% 
+  summarise(n = sum(value)) %>% 
+  arrange(desc(n))
+
+ct_spec_count <- table(peaks_gr_specific_combined$peak_called_in)
+ct_peaks_counts$percent <- ct_peaks_counts$n / 
+  ct_spec_count[ct_peaks_counts$peak_called_in] %>% 
+  as.vector() * 100
+
+ct_peaks_counts$peak_called_in <- factor(ct_peaks_counts$peak_called_in, 
+                                         levels = ct)
+
+# lets limit CATlas cell-types to >25% overlap
+keep <- ct_peaks_counts %>% 
+  filter(percent > 25) %>% 
+  pull(Catlas)
+
+ct_peaks_counts <- ct_peaks_counts %>% 
+  filter(Catlas %in% keep) %>%
+  arrange(desc(percent))
+
+ct_peaks_counts$Catlas <- gsub("[.]", " ", ct_peaks_counts$Catlas)
+
+# Label CATlas cell-type with top overlap with scAF cell-type
+ct_peaks_counts.labels <- ct_peaks_counts %>%
+  distinct(peak_called_in, .keep_all = T) %>%
+  mutate(label = Catlas) %>%
+  select(-c(n:percent))
+
+ct_peaks_counts <- merge(ct_peaks_counts, ct_peaks_counts.labels, all = T)
+
+# re-order by scAF cell-type percent overlap
+catlas.order <- ct_peaks_counts %>%
+  filter(percent > 25) %>%
+  arrange(peak_called_in, desc(percent)) %>%
+  pull(Catlas) %>%
+  unique()
+
+percents.max.catlas <- ct_peaks_counts %>%
+  distinct(Catlas, .keep_all = T) %>%
+  mutate(Catlas = factor(Catlas, levels = catlas.order)) %>%
+  arrange(Catlas)
+
+ct_peaks_counts$Catlas <- factor(ct_peaks_counts$Catlas, levels = catlas.order)
+ct_peaks_counts <- filter(ct_peaks_counts, !is.na(peak_called_in))
+rio::export(ct_peaks_counts, "results/catlas_peak-overlap.csv")
+
+ggplot(ct_peaks_counts, aes(y = peak_called_in,
+                            x = Catlas,
+                            color = percent,
+                            size = percent,
+                            label = label)) + 
+  geom_point() +
+  scale_color_gradient2(high = "darkred",
+                        mid = "white",
+                        low = "blue") +
+  ggrepel::geom_text_repel(size = 4,
+                           color = "black",
+                           min.segment.length = 0,
+                           max.overlaps = 30,
+                           nudge_y = 0.5) +
+  theme(axis.text.x = element_text(angle = 45, 
+                                   vjust = 1, 
+                                   hjust = 1, 
+                                   size = 9)) +
+  ylab(NULL) +
+  xlab("CATlas cell-type") +
+  labs(color = "% Overlap", size = NULL)  +
+  small_legend
+
+ggsave("figs/peaks_summary_stats/dotplot_CATlas_specific_overlap.png", 
+       width = 15, 
+       height = 6)
+```

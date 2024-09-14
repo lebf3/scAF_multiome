@@ -1,0 +1,808 @@
+---
+title: "QC_filters"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(cowplot)
+library(Signac)
+library(harmony)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(patchwork)
+library(ggplot2)
+library(ggExtra)
+library(presto)
+library(SeuratDisk)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(dplyr)
+
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+  panel.background = element_rect(fill = "transparent", colour = NA),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  plot.background = element_rect(fill = "transparent", colour = NA),
+  legend.background  = element_rect(fill = "transparent", colour = NA),
+  legend.key = element_rect(fill = "transparent", colour = NA)
+)
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) +
+  xlab("UMAP1") +
+  ylab("UMAP2") +
+  theme_classic() +
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+```
+
+# functions
+
+```{r}
+# integration and clustering the RNA modality 
+Cluster_RNA_Harmony <- function(seurat_object,
+                                ndim = 30,
+                                clust_res = 0.8,
+                                harmony_vars = "sample",
+                                vars_regress = "percent_mito") {
+  
+  set.seed(2022)
+  DefaultAssay(seurat_object) <- "RNA"
+  
+  SCTransform(seurat_object,
+              verbose = FALSE,
+              vars.to.regress = vars_regress,
+              conserve.memory = T) %>% 
+    RunPCA(npcs = ndim) %>% 
+    RunHarmony(group.by.vars = harmony_vars,
+               assay.use = "SCT") %>% 
+    RunUMAP(dims = 1:ndim,
+            reduction = "harmony",
+            reduction.name = "umap.rna.harmony") %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:ndim) %>% 
+    FindClusters(verbose = FALSE, resolution = clust_res)
+}
+
+# integration and clustering the ATAC modality 
+atac_clustering <- function(seurat_object = scAF,
+                            assay_use = "ATAC",
+                            harmony_var = "sample") {
+  
+  set.seed(2022)
+  DefaultAssay(seurat_object) <- assay_use
+
+  RunTFIDF(seurat_object) %>% 
+    FindTopFeatures(min.cutoff = "q0") %>% 
+    RunSVD() %>% 
+    RunHarmony(group.by.vars = "sample",
+               reduction = "lsi",
+               assay.use = assay_use,
+               reduction.save = paste0(assay_use, "_harmony"),
+               project.dim = FALSE)
+}
+
+# clustering of both modalities
+wnn_clustering <- function(seurat_object = scAF,
+                           reductions_use = list("harmony", "ATAC_harmony"),
+                           sufixes = "ATAC",
+                           resolution = 0.1) {
+  
+  set.seed(2022)
+  
+  FindMultiModalNeighbors(
+    seurat_object,
+    reduction.list = reductions_use,
+    dims.list = list(1:20, 2:20),
+    knn.graph.name = paste0("harmony_wknn_", sufixes),
+    snn.graph.name = paste0("harmony_wsnn_", sufixes),
+    weighted.nn.name = paste0("harmony_weighted_nn_", sufixes)
+  ) %>%
+    FindClusters(graph.name = paste0("harmony_wsnn_", sufixes),
+                 algorithm = 3,
+                 verbose = FALSE,
+                 resolution = resolution)
+}
+```
+
+# scatter plot sample metrics
+
+```{r}
+scAF <- readRDS("data/output/scAF.rds") 
+
+sample_cond_colors_set <- c("#1B59C2",
+                            "#85B0FA",
+                            "#1349A6",
+                            "#D3E1FA",
+                            "#EF323C",
+                            "#AB151D",
+                            "#FB8086",
+                            "black")
+scAF$rhythm <- ifelse(scAF$condition == 0, "AF", "SR")
+scAF$sample <- factor(scAF$sample,
+                      levels = c("CF69",
+                                 "CF77",
+                                 "CF89",
+                                 "CF91",
+                                 "CF93",
+                                 "CF97",
+                                 "CF102",
+                                 "CF94"))
+
+p <- scAF@meta.data %>%
+  ggplot(aes(percent.mt, atac_peak_region_fragments, color = sample)) +
+  geom_point() +
+  scale_color_manual(values = sample_cond_colors_set) +
+  scale_x_log10() + 
+  scale_y_log10() +
+  ylab("Fragments in peak") +
+  xlab("Percent mitochondrial reads")
+
+ggExtra::ggMarginal(p, groupFill = T)
+ggsave("figs/QC_filters/scatter_mt_frag_in_peak.png",
+       height = 5,
+       width = 6)
+```
+
+# Filters plots
+
+```{r}
+# remove low quality sample
+scAF <- subset(scAF, subset = sample != "CF94")
+scAF$rhythm <- ifelse(scAF$condition == 0, "AF", "SR") 
+scAF$sample <- factor(
+  scAF$sample,
+  levels = c("CF69", "CF77", "CF89", "CF91", "CF93", "CF97", "CF102")
+  )
+
+# initial filters
+vars <- c("nCount_ATAC",
+          "nCount_RNA",
+          "percent.mt",
+          "TSS.enrichment",
+          "pct_reads_in_peaks")
+n.ylabs <- c("ATAC count",
+             "RNA count",
+             "Percent mitochondrial counts",
+             "TSS enrichment",
+             "Percent ATAC count in peaks")
+
+
+scAF@meta.data <- scAF@meta.data %>%
+  mutate(sample_rem = as.character(sample),
+         sample_rem = ifelse(
+           nCount_ATAC < 400 |
+             nCount_RNA < 200 |
+             percent.mt > 10 |
+             TSS.enrichment < 2 |
+             pct_reads_in_peaks < 10,
+           "low.q",
+           sample_rem))
+
+filters <- list(400, 200, 10, 2, 10)
+
+hex_codes1 <- scales::hue_pal()(7)
+hex_codes1 <- c(hex_codes1, "black") # low quality cells are black
+
+# show low quality cells with hist of cell count by metric
+l.p <- lapply(1:length(vars), function(v) {
+  p <- scAF@meta.data %>%
+    ggplot(aes_string(x = vars[[v]], fill = "sample_rem")) +
+    geom_histogram(bins = 100) +
+    geom_vline(xintercept = filters[[v]], linetype = "dashed") +
+    scale_x_log10() +
+    scale_fill_manual(values = hex_codes1) +
+    xlab(n.ylabs[v])
+  
+  if (v != 3) {
+    p + theme(legend.position = "none")
+  }
+  else{
+    p
+  }
+})
+
+l.p[[4]] <- l.p[[4]] + 
+  xlim(0.1, 7)
+patchwork::wrap_plots(l.p)
+ggsave("figs/QC_filters/filters.png",
+       width = 12,
+       height = 6)
+```
+
+## Co-embedding scAF with heart atlas nuclei
+
+```{r}
+# import heart atlas and filter for nuclei
+reference <- readRDS("data/output/Litvinukova2020_LA.RDS")
+reference <- subset(x = reference, subset = source == "Nuclei")
+reference$dataset <- "h.Atlas"
+
+scAF <- subset(scAF, subset = sample_rem != "low.q")
+scAF@meta.data <- scAF@meta.data %>% 
+  mutate(sample = factor(sample),
+         percent_mito = percent.mt / 100,
+         donor = sample,
+         gender = sex,
+         dataset = "scAF")
+
+sn_heart <- merge(reference, scAF)
+rm(reference)
+gc()
+
+# SCT + harmony on merged object
+sn_heart <- Cluster_RNA_Harmony(sn_heart)
+
+p1 <- DimPlot(sn_heart,
+              group.by = "seurat_clusters",
+              reduction = "umap.rna.harmony",
+              label = T) + 
+  ggtitle("Initial clusters h.Atlas + scAF") + 
+  NoAxes() + 
+  NoLegend()
+
+p2 <- DimPlot(sn_heart,
+              group.by = "dataset",
+              reduction = "umap.rna.harmony",
+              cols = c("grey", "darkred")) + 
+  ggtitle("Dataset") + 
+  NoAxes() + 
+  theme(legend.position = "top")
+
+p3 <- DimPlot(sn_heart,
+              group.by = "cell_type",
+              reduction = "umap.rna.harmony",
+              label = T) +
+  ggtitle("H. Atlas cell-types") + 
+  NoAxes() + 
+  NoLegend()
+
+p1 + inset_element(
+  p_umap,
+  left = -0.01,
+  bottom = -0.01,
+  right = 0.23,
+  top = 0.25
+) | p2 | p3
+
+ggsave("figs/QC_filters/initial_clustering_UMAP.png",
+       width = 18,
+       height = 6)
+```
+
+## Preliminary annotation
+
+```{r}
+DefaultAssay(sn_heart) <- "RNA"
+Idents(sn_heart) <- "dataset"
+
+scAF <- subset(sn_heart, idents = "scAF")
+
+Idents(scAF) <- "seurat_clusters"
+scAF <- RenameIdents(scAF,
+                     "0" = "CM",
+                     "5" = "CM",
+                     "13" = "CM",
+                     "18" = "CM",
+                     "1" = "FB",
+                     "4" = "FB",
+                     "12" = "FB",
+                     "20" = "FB",
+                     "24" = "FB",
+                     "26" = "FB",
+                     "2" = "PC",
+                     "19" = "PC",
+                     "25" = "PC",
+                     "3" = "EC",
+                     "21" = "EC",
+                     "6" = "Myeloid",
+                     "10" = "Myeloid",
+                     "22" = "Myeloid",
+                     "7" = "Endocardial",
+                     "8" = "Mesothelial",
+                     "9" = "Lymphoid",
+                     "11" = "Adipo",
+                     "14" = "Neuron",
+                     "15" = "SMC",
+                     "16" = "SMC",
+                     "17" = "low.q",
+                     "23" = "Mast")
+
+scAF$cell_type <- Idents(scAF)
+
+# plot marker genes
+markers <- presto:::wilcoxauc.Seurat(X = scAF,
+                            group_by = "cell_type",
+                            assay = "data",
+                            seurat_assay = "RNA") %>%
+  group_by(group) %>%
+  slice_max(auc, n = 2) %>%
+  mutate(group_f = factor(group, levels = levels(scAF$cell_type))) %>%
+  arrange(group_f)
+
+p1 <- DimPlot(scAF,
+              group.by = "cell_type",
+              reduction = "umap.rna.harmony",
+              label = T) +
+  ggtitle("Initial cell-types scAF") +
+  NoAxes() +
+  NoLegend()
+
+p2 <- VlnPlot(scAF, features = "percent.mt", log = T) +
+  NoLegend() +
+  xlab(NULL)
+
+p_dp <- DotPlot(scAF,
+                features = unique(markers$feature),
+                group.by = "cell_type") +
+  RotatedAxis() +
+  NoLegend() +
+  ylab("") +
+  xlab("") +
+  coord_flip()
+
+p1 + inset_element(
+  p_umap,
+  left = -0.01,
+  bottom = -0.01,
+  right = 0.22,
+  top = 0.25
+) | p2 | p_dp
+
+ggsave("figs/QC_filters/initial_annotation.png", width = 18, height = 6)
+```
+
+## call doublets
+
+```{r}
+# RNA 
+DefaultAssay(scAF) <- "RNA"
+sce <- as.SingleCellExperiment(scAF)
+sce <- scDblFinder(sce,
+                   clusters = "cell_type",
+                   samples = "sample",
+                   BPPARAM = BiocParallel::SnowParam(3))
+
+keep <- c("scDblFinder.class",
+          "scDblFinder.score",
+          "scDblFinder.weighted",
+          "scDblFinder.difficulty",
+          "scDblFinder.cxds_score",
+          "scDblFinder.mostLikelyOrigin",
+          "scDblFinder.originAmbiguous")
+RNA_dblt <- sce@colData
+
+# ATAC 
+DefaultAssay(scAF) <- "ATAC"
+sce <- as.SingleCellExperiment(scAF)
+sce <- scDblFinder(sce,
+                   aggregateFeatures = TRUE,
+                   nfeatures = 100,
+                   processing = "normFeatures",
+                   clusters = "cell_type",
+                   samples = "sample")
+ATAC_dblt <- sce@colData
+
+# save doublet scores (seed not taken)
+ATAC_dblt <- as.data.frame(ATAC_dblt)
+colnames(ATAC_dblt) <- paste0("ATAC_", colnames(ATAC_dblt))
+RNA_dblt <- as.data.frame(RNA_dblt)
+colnames(RNA_dblt) <- paste0("RNA_", colnames(RNA_dblt))
+
+saveRDS(RNA_dblt, "data/output/RNA_scDblFinder.rds")
+saveRDS(ATAC_dblt, "data/output/ATAC_scDblFinder.rds")
+```
+
+## clean up metadata and save the results
+
+```{r}
+RNA_dblt <- readRDS("data/output/RNA_scDblFinder.rds") 
+ATAC_dblt <- readRDS("data/output/ATAC_scDblFinder.rds")
+
+scAF$RNA_scDbt_score <- RNA_dblt$RNA_scDblFinder.score
+scAF$ATAC_scDbt_score <- ATAC_dblt$ATAC_scDblFinder.score
+
+keep <- c("sample",
+          "sex",
+          "condition",
+          "Rythm",
+          "nCount_RNA",
+          "nFeature_RNA",
+          "percent.mt",
+          "nCount_ATAC",
+          "nFeature_ATAC",
+          "atac_peak_region_fragments",
+          "pct_reads_in_peaks",
+          "nucleosome_signal",
+          "nucleosome_percentile",
+          "TSS.enrichment",
+          "TSS.percentile",
+          "high.tss",
+          "nucleosome_group",
+          "cell_type",
+          "nCount_SCT",
+          "nFeature_SCT",
+          "seurat_clusters",
+          "RNA_scDbt_score",
+          "ATAC_scDbt_score")
+
+scAF$RNA.ATAC_scDbt_score <- scAF$ATAC_scDbt_score * scAF$RNA_scDbt_score
+scAF$RNA.ATAC_scDbt_class <- scAF$RNA.ATAC_scDbt_score > 0.5
+
+p.dbl <-  DimPlot(scAF,
+                  group.by = "RNA.ATAC_scDbt_class",
+                  reduction = "umap.rna.harmony", 
+                  cols = c("grey", "darkred")) + 
+  ggtitle("High confidence doublets") +
+  NoAxes() +
+  theme(legend.position = "top")
+```
+
+# Cluster calling with WNN
+
+```{r}
+scAF <- subset(scAF, subset = RNA.ATAC_scDbt_class == F & cell_type != "low.q")
+
+# RNA
+set.seed(2022)
+DefaultAssay(scAF) <- "RNA"
+scAF <- SCTransform(scAF, verbose = FALSE, vars.to.regress = "percent.mt") %>% 
+  RunPCA(npcs = 20) %>% 
+  RunHarmony(group.by.vars = c("sample"), assay.use = "SCT") 
+
+# ATAC
+scAF <- atac_clustering()
+
+# WNN
+scAF <- wnn_clustering()
+
+scAF <- RunUMAP(scAF, 
+                nn.name = "harmony_weighted_nn_ATAC",
+                reduction.name = "harmony_wnn_umap")
+
+DimPlot(scAF,
+        reduction = "harmony_wnn_umap",
+        label = T) +
+  ggtitle("WNN clusters") +
+  NoAxes() +
+  NoLegend() | 
+  DimPlot(scAF,
+          group.by = "cell_type",
+        reduction = "harmony_wnn_umap",
+        label = T) +
+  ggtitle("H. Atlas cell-types") +
+  NoAxes() +
+  NoLegend()
+ggsave("figs/QC_filters/first_doublet_filter_umap.png")
+```
+
+## Annotate and save
+
+```{r}
+scAF <- RenameIdents(scAF,
+                     "0" = "CM",
+                     "1" = "FB",
+                     "2" = "Myeloid",
+                     "3" = "Mesothelial",
+                     "4" = "EC",
+                     "5" = "Endocardial",
+                     "6" = "PC",
+                     "7" = "Mito.high",
+                     "8" = "Lymphoid",
+                     "9" = "Neuron",
+                     "10" = "Adipo")
+
+scAF$WNN_cell_types <- Idents(scAF)
+```
+
+
+# Subclustering for doublet identification
+Here we use the scDblFinder score and cell-type markers to flag sub-clusters that are likely doublets
+
+## Call marker genes
+
+```{r}
+# marker genes
+markers <- presto:::wilcoxauc.Seurat(X = scAF,
+                                     group_by = "cell_type",
+                                     assay = "data",
+                                     seurat_assay = "RNA")
+
+markers.top1 <- markers %>% 
+  dplyr::filter(group != "Not.specific") %>% 
+  dplyr::filter(pct_out < 50) %>% 
+  group_by(group) %>% 
+  slice_max(auc, n = 1) %>% 
+  pull(feature)
+
+markers.groups <- markers %>%
+  dplyr::filter(group != "Not.specific") %>%
+  pull(group) %>%
+  unique()
+```
+
+
+## Sub-cluster cell-types to identify remaining doublets
+
+```{r}
+# loop over cell-types
+celltypes <- c("CM",
+               "FB",
+               "Myeloid",
+               "Mesothelial",
+               "EC",
+               "Endocardial",
+               "PC",
+               "Lymphoid",
+               "Neuron")
+
+for (ct in celltypes) {
+  set.seed(2022)
+  sub <- subset(scAF, subset = WNN_cell_types == ct)
+  
+  DefaultAssay(sub) <- "RNA"
+  sub <- SCTransform(sub, 
+                     verbose = FALSE, 
+                     vars.to.regress = "percent.mt") %>% 
+    RunPCA(npcs = 20) %>% 
+    RunHarmony(group.by.vars = c("sample"),
+               assay.use = "SCT")
+
+  ## ATAC
+  DefaultAssay(sub) <- "ATAC"
+  sub <- atac_clustering(seurat_object = sub)
+
+  ## WNN
+  sub <- wnn_clustering(seurat_object = sub, 
+                        reductions_use = list("harmony", "ATAC_harmony"), 
+                        sufixes = "", 
+                        resolution = 0.5) %>% 
+    RunUMAP(nn.name = "harmony_weighted_nn_",
+            reduction.name = "harmony_wnn_umap")
+  
+  ## plot subclusters
+  umap_WNN.clust <- DimPlot(object = sub,
+                            reduction = "harmony_wnn_umap",
+                            group.by = "seurat_clusters",
+                            label = T) + 
+    ylab(NULL) + 
+    xlab(NULL) + 
+    ggtitle("Clusters") +
+    NoLegend()
+
+  ## plot doublet scores
+  umap_WNN.db.score <- FeaturePlot(object = sub,
+                                   reduction = "harmony_wnn_umap",
+                                   feature = "RNA.ATAC_scDbt_score") + 
+    ylab(NULL) + 
+    xlab(NULL) + 
+    ggtitle("scDblFinder score ATAC * RNA")
+  
+  vnl_WNN.db.score <- VlnPlot(object = sub, feature = "RNA.ATAC_scDbt_score") + 
+    ggtitle("scDblFinder score ATAC * RNA")
+  
+  patch <- umap_WNN.clust | umap_WNN.db.score | vnl_WNN.db.score
+  
+  fig.path <- paste0("figs/QC_filters_wnn/sub_", ct, "/")
+  dir.create(fig.path)
+  ggsave(plot = patch,
+         paste0(fig.path, "umap_wnn_scAF_Dbl_score.png"),
+         width = 18,
+         height = 6)
+  
+  ## plot top RNA markers for cell-types on WNN UMAP
+  DefaultAssay(sub) <- "RNA"
+  p.features <- FeaturePlot(sub,
+                            markers.top1, 
+                            reduction = "harmony_wnn_umap", 
+                            combine = F)
+  
+  p.features2 <- lapply(1:length(p.features), function(x) {
+    p.features[[x]] + 
+      labs(subtitle = markers.groups[x]) + 
+      NoAxes()
+  })
+  
+  ggsave(plot = wrap_plots(p.features2),
+         paste0(fig.path, "umap_wnn_scAF_RNA_markers.png"),
+         width = 18,
+         height = 12)
+  
+  sub$sub.ct.clusters <- paste0(ct, "_", sub$harmony_wsnn__res.0.5)
+  saveRDS(sub@meta.data, paste0(fig.path, "meta.rds"))
+}
+```
+
+## Annotate probable doublets
+
+```{r}
+sub_meta <- lapply(celltypes, function(ct) { 
+  readRDS(paste0("figs/QC_filters_wnn/sub_", ct, "/", "meta.rds"))
+}) %>% do.call(rbind, .) 
+
+sub_meta <- sub_meta %>%
+  mutate(WNN.sub.ct = sub.ct.clusters) %>%
+  mutate(WNN.sub.ct = case_when(
+    WNN.sub.ct %in% c("CM_1", 
+                      "FB_5", 
+                      "EC_4", 
+                      "Endocardial_2", 
+                      "Endocardial_4", 
+                      "Endocardial_7", 
+                      "Lymphoid_1", 
+                      "Lymphoid_4", 
+                      "Mesothelial_2", 
+                      "Mesothelial_4", 
+                      "Myeloid_2", 
+                      "Myeloid_8", 
+                      "Myeloid_5", 
+                      "Neuron_1", 
+                      "PC_3") ~ "dbl",
+    WNN.sub.ct %in% c("FB_7", "FB_8") ~ "SMC",
+    WNN.sub.ct %in% c("Lymphoid_5") ~ "Mast",
+    TRUE ~ WNN.sub.ct
+  ))
+
+sub_meta$WNN.sub.ct <- limma::strsplit2(sub_meta$WNN.sub.ct,"_")[,1]
+saveRDS(sub_meta[, c("sub.ct.clusters", "WNN.sub.ct")], 
+        "data/output/metadata_subcluster_dbl.rds")
+```
+
+## sub-cell-type doublet removal
+
+```{r}
+sub_meta <- readRDS("data/output/metadata_subcluster_dbl.rds")
+sub_meta <- select(sub_meta, WNN.sub.ct)
+scAF <- AddMetaData(scAF, metadata = sub_meta)
+
+scAF$WNN.sub.ct[is.na(scAF$WNN.sub.ct)] <- as.character(scAF$WNN_cell_types)[
+  is.na(scAF$WNN.sub.ct)
+  ]
+
+scAF$sub_doublet <- scAF$WNN.sub.ct == "dbl"
+
+# plot cells removed
+p.sub_dbl <- DimPlot(scAF,
+                     group.by = "sub_doublet",
+                     reduction = "umap.rna.harmony",
+                     cols = c("grey", "darkred")) + 
+  ggtitle("Sub-cell-type doublets") + 
+  NoAxes() + 
+  theme(legend.position = "top")
+
+p.vln <- VlnPlot(scAF,
+                 group.by = "WNN_cell_types",
+                 features = "nCount_RNA",
+                 split.by = "sub_doublet",
+                 log = T) +
+  xlab(NULL) + 
+  scale_fill_manual(name = "Sub-cell-type doublets", 
+                    values = c("grey", "darkred")) + 
+  theme(legend.position = "top")
+
+p.dbl + inset_element(p_umap,
+                      left = -0.01,
+                      bottom = -0.01,
+                      right = 0.20,
+                      top = 0.25) | p.sub_dbl | p.vln
+ggsave("figs/QC_filters/UMAP_doublets.png", width = 18, height = 6)
+```
+
+# Final clustering
+
+```{r}
+scAF <- subset(scAF,
+               subset = WNN.sub.ct %in% c("dbl", "Mito.high"),
+               invert = T) %>% 
+  DietSeurat(counts = TRUE, data = TRUE)
+
+set.seed(2022)
+DefaultAssay(scAF) <- "RNA"
+scAF <- SCTransform(scAF,
+                     verbose = FALSE,
+                     vars.to.regress = "percent.mt") %>%
+  RunPCA(npcs = 20) %>%
+  RunHarmony(group.by.vars = c("sample"),
+             assay.use = "SCT")
+
+## ATAC
+DefaultAssay(scAF) <- "ATAC"
+scAF <- atac_clustering()
+
+## WNN
+scAF <- wnn_clustering()
+
+saveRDS(scAF, "data/output/scAF_final.rds")
+```
+
+**call peaks by cell-type**
+Ubuntu partition
+```{r}
+# conda activate R
+# R
+# library(Signac)
+# library(Seurat)
+# setwd("/home/lebf3/snAF/")
+# scAF <- readRDS("data/output/scAF_final.rds")
+# peaks <- CallPeaks(scAF, 
+#                    assay = "ATAC",
+#                    group.by = "WNN.sub.ct", 
+#                    macs2.path = "../miniconda3/bin/macs2", 
+#                    outdir = "data/macs2.out/", 
+#                    cleanup = F)
+# saveRDS(peaks, "data/output/scAF.ct.peaks.rds")
+```
+
+# Create new Chromatin assay
+
+```{r}
+peaks <- readRDS("data/output/scAF.ct.peaks.rds") 
+
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, 
+                          ranges = blacklist_hg38_unified, 
+                          invert = TRUE)
+
+DefaultAssay(scAF) <- "ATAC"
+
+# quantify counts in each peak
+fragments <- CreateFragmentObject(path = "data/input/atac_fragments.tsv.gz",
+                                  cells = colnames(scAF),
+                                  validate.fragments = FALSE)
+
+macs2_counts <- FeatureMatrix(fragments = fragments,
+                              features = peaks,
+                              cells = colnames(scAF),
+                              process_n = 4000)
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+genome(annotations) <- "hg38"
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+scAF[["peaks2"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = "data/input/atac_fragments.tsv.gz",
+  annotation = annotations
+  )
+
+DefaultAssay(scAF) <- "peaks2"
+scAF <- RegionStats(scAF, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+## peaks2 embedding
+set.seed(2022)
+scAF <- atac_clustering(assay_use = "peaks2") %>% 
+  RunUMAP(dims = 2:20,
+          reduction = "peaks2_harmony",
+          reduction.name = "umap_peaks2_harmony")
+
+
+## WNN
+scAF <- wnn_clustering(reductions_use = list("harmony", "peaks2_harmony"),
+                       sufixes = "peaks2") %>% 
+  RunUMAP(nn.name = "harmony_weighted_nn_peaks2", 
+          reduction.name = "harmony_wnn_peaks2_umap")
+
+# Order and re-level samples and cell-types by count for downstream plots
+scAF$sample <- factor(scAF$sample,
+                      levels = c("CF69",
+                                 "CF77",
+                                 "CF89",
+                                 "CF91",
+                                 "CF93",
+                                 "CF97",
+                                 "CF102"))
+
+ct.lvs <- scAF@meta.data %>% 
+  dplyr::count(WNN.sub.ct) %>% 
+  arrange(desc(n)) %>% 
+  pull(WNN.sub.ct)
+
+scAF$WNN.sub.ct <- factor(scAF$WNN.sub.ct, levels = ct.lvs)
+
+saveRDS(scAF, "data/output/scAF_peaks2.rds")
+```

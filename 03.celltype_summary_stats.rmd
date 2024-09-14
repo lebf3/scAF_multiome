@@ -1,0 +1,140 @@
+---
+title: "celltype_summary_stats"
+author: "Francis Leblanc"
+date: "05/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(cowplot)
+library(presto)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA)
+    )
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+
+sample_by_cond_colors_set <- c("#1B59C2", "#85B0FA","#1349A6", "#D3E1FA",
+                               "#EF323C","#AB151D","#FB8086")
+```
+
+# Plot cell-types and their relative representation in scAF
+
+```{r}
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+
+# Keep top 100 cell-type markers for reference
+markers <- presto:::wilcoxauc.Seurat(X = scAF,
+                                     group_by = 'WNN.sub.ct',
+                                     assay = 'data',
+                                     seurat_assay = 'RNA') 
+
+markers_top100 <- markers %>% 
+  filter(padj < 0.01 & auc > 0.5) %>% 
+  group_by(group) %>% 
+  slice_max(auc, n = 100)
+rio::export(markers_top100, "results/top100_markers_by_celltype.csv")
+
+# Dotplot cell-type markers
+markers_top1 <- markers %>% 
+  group_by(group) %>% 
+  slice_max(auc, n = 1) %>% 
+  mutate(group = factor(group, levels = levels(scAF$WNN.sub.ct))) %>% 
+  arrange(group)
+
+dp <- DotPlot(scAF, 
+              assay = "RNA", 
+              features = markers_top1$feature, 
+              group.by = "WNN.sub.ct",
+              dot.min = 0.1) + 
+  scale_colour_viridis_c() + 
+  xlab(NULL) + 
+  ylab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        # axis.text.y = element_blank(),
+        legend.title = element_text(size = 10),
+        legend.key.size = unit(0.2, 'in'),
+        legend.text = element_text(size = 10),
+        legend.position = c(1,0.4),
+        plot.margin = margin(t = 0, r = 1.5, b = 0, l = 0, unit = "in")) 
+
+# Barplot sample proportions
+bp1 <- ggplot(scAF@meta.data, aes(x = WNN.sub.ct, fill = sample)) + 
+  geom_bar(position = "fill") + 
+  coord_flip() + 
+  scale_fill_manual(values = sample_by_cond_colors_set) + 
+  xlab(NULL) +
+  ylab("Fraction of cells") + 
+  theme(legend.position = "left", 
+        axis.title.x = element_text(vjust = 10))
+
+# Barplot cell counts
+counts <- scAF@meta.data %>%
+  group_by(WNN.sub.ct) %>%
+  summarise(count = n()) %>% 
+  arrange(count)
+
+counts <- counts %>%
+  mutate(hjust = ifelse(row_number() > (n() - 2), 1.1, -0.1),
+         color = ifelse(row_number() > (n() - 2), "white", "black"))
+
+bp2 <- ggplot(scAF@meta.data, aes(x = WNN.sub.ct)) + 
+  geom_bar() + 
+  coord_flip() + 
+  scale_fill_manual(values = sample_by_cond_colors_set) + 
+  xlab(NULL) +
+  ylab("Cell count") +
+  NoLegend() + 
+  theme(axis.text.y = element_blank(), 
+        axis.title.x = element_text(vjust = 10)) +
+  geom_text(data = counts,
+            aes(x = WNN.sub.ct,
+                y = count,
+                label = count,
+                hjust = hjust,
+                color = color)) +
+  scale_color_identity()
+
+# WNN UMAP cell-types
+umap_WNN <- DimPlot(object = scAF,
+                    reduction = "harmony_wnn_peaks2_umap",
+                    group.by = "WNN.sub.ct",
+                    label = T) + 
+  ylab(NULL) + 
+  xlab(NULL) + 
+  ggtitle(NULL) +
+  NoLegend() +
+  NoAxes()
+
+# Assemble plots with patchwork
+umap_WNN + 
+  inset_element(p_umap, left = -0.01, bottom = -0.01, right = 0.20, top = 0.25) +
+  bp1 + 
+  bp2 + 
+  dp +
+  plot_layout(nrow = 1, widths = c(1.3,0.8,0.4,0.8))
+dir.create("figs/celltype_summary_stats")
+ggsave("figs/celltype_summary_stats/umap_wnn_barplot_cell_counts.png", 
+       width = 18, 
+       height = 6)
+```

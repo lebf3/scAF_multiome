@@ -1,0 +1,256 @@
+---
+title: "FB_subclustering"
+author: "Francis Leblanc"
+date: '2022-09-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggpubr)
+library(harmony)
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(fgsea)
+library(dplyr)
+
+theme_set(theme_cowplot())
+
+set.seed(2022)
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA))
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+  xlab("UMAP1") +
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+
+small_legend <- theme(legend.title = element_text(size = 10),
+                      legend.key.size = unit(0.2, 'in'),
+                      legend.text = element_text(size = 10)) 
+```
+
+# RNA processing wrapper
+
+```{r}
+process_seurat <- function(obj, 
+                           n_dims, 
+                           harmony_vars = "sample", 
+                           vars.regress = NULL,
+                           conserve.memory = T) {
+
+  SCTransform(obj, 
+              assay = "RNA", 
+              verbose = F, 
+              conserve.memory = conserve.memory, 
+              vars.to.regress = vars.regress) %>% 
+    RunPCA(npcs = n_dims, assay = "SCT", reduction.name = "pca_new") %>% 
+    RunHarmony(group.by.vars = harmony_vars, 
+               assay.use="SCT", 
+               reduction = "pca_new", 
+               reduction.save = "harmony.new") %>% 
+    RunUMAP(dims = 1:n_dims,
+            reduction = "harmony.new", 
+            reduction.name = "harmony.new.UMAP") %>% 
+    FindNeighbors(obj, 
+                  dims = 1:n_dims, 
+                  verbose = FALSE, 
+                  reduction = "harmony.new")
+}
+```
+
+# FB sub-clusters 
+
+```{r}
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+FB <- subset(scAF, WNN.sub.ct == "FB")
+rm(scAF)
+gc()
+DefaultAssay(FB) <- "RNA"
+
+FB <- process_seurat(FB, 10, vars.regress = "percent.mt")
+DefaultAssay(FB) <- "SCT"
+FB <- FindClusters(FB, resolution = 0.1)
+FB <- subset(FB, seurat_clusters != 3)
+FB$seurat_clusters <- factor(FB$seurat_clusters)
+DefaultAssay(FB) <- "RNA"
+
+FB <- DietSeurat(FB, assays = "RNA", dimreducs = "harmony.new.UMAP")
+FB@meta.data <- FB@meta.data %>% 
+  dplyr::select(sample, sex, rhythm, nCount_RNA, nFeature_RNA, seurat_clusters)
+
+saveRDS(FB, "data/output/FB_scAF.rds") 
+```
+
+## plot markers and UMAP
+
+```{r}
+FB <- RenameIdents(FB, '0' = "aFB1", '1' = "aFB2", '2' = "aFB3")
+FB$sub.fb <- Idents(FB)
+
+# UMAP
+p1 <- DimPlot(FB, reduction = "harmony.new.UMAP", label = T, label.size = 6) + 
+  NoLegend() + 
+  NoAxes() + 
+  ggtitle(NULL) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.3, top = 0.2) 
+
+# Dotplot
+top2 <- presto:::wilcoxauc.Seurat(X = FB,
+                                  assay = 'data',
+                                  seurat_assay = 'RNA',
+                                  group_by = "sub.fb") %>%
+  dplyr::filter(logFC > 0) %>%
+  group_by(group) %>% 
+  dplyr::slice_max(logFC, n=2)
+
+dp <- DotPlot(FB,
+              assay = "RNA",
+              features = top2$feature,
+              group.by = "sub.fb",
+              dot.min = 0.15 ,
+              cols = c("#CCCCCC20", "darkred")) +
+  xlab(NULL) + 
+  ylab(NULL) +
+  coord_flip() +
+  theme(legend.position = c(1.1,0.3), 
+        plot.margin = margin(t = 0, r = 75, b = 0, l = 0, unit = "pt")) +
+  small_legend + 
+  guides(color = guide_colorbar(title = "Average\nExpression")) + 
+  guides(size = guide_legend(title = "Percent\nExpressed")) 
+
+# barplot proportions
+bp <- FB@meta.data %>% 
+  ggplot(aes(y = rhythm, fill = sub.fb)) + 
+  geom_bar(position = "fill") + 
+  ylab("Rhythm") + 
+  xlab("FB Fraction") + 
+  labs(fill = "FB states") + 
+  NoLegend()
+
+markers <- presto:::wilcoxauc.Seurat(X = FB,
+                                     assay = 'data',
+                                     seurat_assay = 'RNA',
+                                     group.by = "sub.fb") %>%
+  group_by(group) %>%
+  dplyr::filter(padj < 0.01) 
+
+markers %>%
+  dplyr::filter(logFC > 0) %>%
+  rio::export("results/subFB_markers.csv")
+
+p1|(dp/bp)
+ggsave("figs/FB_subclustering/LAA_FB_clust_umap.png", width = 9, height = 5)
+```
+
+## pathways enriched in each sub-FB
+
+```{r}
+# get markers for each clusters
+DefaultAssay(FB) <- "RNA"
+markers <- presto:::wilcoxauc.Seurat(X = FB, 
+                                     assay = 'data', 
+                                     seurat_assay = 'RNA') 
+
+run_fgsea <- function(pw, rk) {
+  set.seed(2023)
+  fgseaRes <- fgsea(pw, rk,  minSize = 3, eps = 1e-50, nproc = 4)
+  fgseaRes %>% 
+    dplyr::select(-ES, -log2err, -pval) %>% 
+    arrange(padj)
+}
+
+# get molecular pathways and format as lists
+path_names <- c("GO_Biological_Process_2021", "MSigDB_Hallmark_2020")
+
+l_path <- lapply(path_names, function(i){
+  x <- scan(paste0("data/input/Pathways/", i, ".txt"), what = "", sep = "\n")
+  y <- strsplit(x, "\t")
+  names(y) <- sapply(y, `[[`, 1)
+  lapply(y, `[`, -c(1:2))
+})
+
+names(l_path) <- path_names
+for (i in 1:length(l_path[["GO_Biological_Process_2021"]])) {
+  
+  clean_names <- names(l_path[["GO_Biological_Process_2021"]])[i] %>% 
+    gsub(pattern = "([0-9]+).", "", .) %>% 
+    gsub(pattern = "[(GO:)]", "", .)
+  
+  names(l_path[["GO_Biological_Process_2021"]])[i] <- clean_names
+}
+
+
+FB_types <- c("aFB1", "aFB2", "aFB3")
+
+l_path_res <- lapply(FB_types, function(x){
+  
+  # fgsea on top markers
+  markers_FB <- markers %>% 
+    dplyr::filter(group == x & padj < 0.01 & abs(logFC) > 0.1)
+  
+  markers_FB_auc <- markers_FB$auc - 0.5 # ranking metric
+  names(markers_FB_auc) <- markers_FB$feature
+  
+  path_GO_BP <- run_fgsea(l_path[["GO_Biological_Process_2021"]], 
+                          markers_FB_auc)
+  path_Hallmark <- run_fgsea(l_path[["MSigDB_Hallmark_2020"]],
+                             markers_FB_auc)
+  
+  path_GO_BP$set <- "GO.BP"
+  path_Hallmark$set <- "Hallmark"
+  path_combined <- rbind(path_GO_BP, path_Hallmark)
+  path_combined$FB_sub <- x
+  path_combined
+})
+path_combined <- do.call(rbind, l_path_res)
+```
+
+## plot and save top pathways 
+
+```{r}
+top_path <- dplyr::filter(path_combined, padj < 0.05)
+
+pathway_keep <- top_path %>% 
+  group_by(set, FB_sub) %>% 
+  dplyr::filter(NES > 0) %>%
+  slice_min(padj, n = 3) %>%
+  pull(pathway)
+
+top_path <- top_path %>% 
+  dplyr::filter(pathway %in% pathway_keep) %>% 
+  arrange(desc(NES)) %>% 
+  mutate(pathway = factor(pathway, levels = pathway[!duplicated(pathway)]))
+  
+p <- top_path %>% 
+  ggplot(aes(y = pathway, x = FB_sub, fill = NES, size = -log10(padj))) +
+  geom_point(shape = 21) + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "darkred") + 
+  ylab(NULL) +
+  xlab("FB states") +
+  small_legend +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+facet(p, 
+      facet.by = c("set"),
+      ncol = 1, 
+      scales = "free_y", 
+      panel.labs.background = list(color = "transparent", fill = "transparent"),
+      panel.labs.font = list(size = 10))
+
+ggsave("figs/FB_subclustering/Pathways_sub_FB_GO_halmark.png", 
+       height = 5, 
+       width = 7)
+rio::export(top_path, "results/top_subFB_pathways.csv")
+```

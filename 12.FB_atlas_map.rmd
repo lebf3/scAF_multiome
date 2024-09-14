@@ -1,0 +1,336 @@
+---
+title: "FB_atlas_map"
+author: "Francis Leblanc"
+date: '2022-09-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggpubr)
+library(harmony)
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(fgsea)
+library(dplyr)
+library(biomaRt)
+library(presto)
+
+theme_set(theme_cowplot())
+
+set.seed(2022)
+
+trs_theme <- theme(
+  panel.background = element_rect(fill = "transparent",colour = NA),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  plot.background = element_rect(fill = "transparent",colour = NA),
+  legend.background  = element_rect(fill = "transparent",colour = NA),
+  legend.key = element_rect(fill = "transparent",colour = NA)
+  )
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+```
+
+# RNA processing wrapper
+
+```{r}
+process_seurat <- function(obj, 
+                           n_dims, 
+                           harmony_vars = "sample", 
+                           vars.regress = NULL,
+                           conserve.memory = T) {
+  
+  SCTransform(obj, 
+              assay = "RNA", 
+              verbose = F, 
+              conserve.memory = conserve.memory, 
+              vars.to.regress = vars.regress) %>% 
+    RunPCA(npcs = n_dims, assay = "SCT", reduction.name = "pca_new") %>% 
+    RunHarmony(group.by.vars = harmony_vars, 
+               assay.use="SCT", 
+               reduction = "pca_new", 
+               reduction.save = "harmony.new") %>% 
+    RunUMAP(dims = 1:n_dims,
+            reduction = "harmony.new", 
+            reduction.name = "harmony.new.UMAP") %>% 
+    FindNeighbors(obj, 
+                  dims = 1:n_dims, 
+                  verbose = FALSE, 
+                  reduction = "harmony.new")
+}
+```
+
+# Co-embedding with H.atlas
+
+```{r}
+hca_fb <- SeuratDisk::LoadH5Seurat(
+  "data/input/hca_heart_fibroblasts_raw.h5seurat"
+  )
+hca_fb <- subset(hca_fb, subset = cell_source == "Harvard-Nuclei")
+hca_fb$sample <- factor(hca_fb$sample) 
+
+hca_fb <- process_seurat(hca_fb, n_dims = 15, harmony_vars = "sample") 
+hca_fb <- FindClusters(hca_fb, verbose = FALSE, resolution = 0.02)
+
+# 2 is CM doublet, 1 is Endo + pericyte doublet
+hca_fb <- subset(hca_fb, ident = c(0,3)) 
+
+FB <- readRDS("data/output/FB_scAF.rds") 
+# harmonize labels "sample", "region", "sex", "rhythm", "disease", "major_labl"
+FB@meta.data <- FB@meta.data %>% 
+  mutate(region = "LAA",
+         major_labl = paste0("LAA_", rhythm),
+         disease = rhythm)
+
+FB$sex <- recode(FB$sex, "M" = "male", "F" = "female") 
+hca_fb$sex <- recode(hca_fb$gender, "Male" = "male", "Female" = "female") 
+
+hca_fb@meta.data <- hca_fb@meta.data %>% 
+  mutate(major_labl = region,
+         disease = "CTRL")
+
+FB_A <- merge(FB, hca_fb)
+DefaultAssay(FB_A) <- "RNA"
+```
+
+
+# ACM
+
+```{r}
+ACM_lv <- readRDS("data/input/FB_ACM_DCM_Reichart.rds")
+
+# process data
+ACM_lv@meta.data <- rename(ACM_lv@meta.data, sample = Sample)
+ACM_lv <- subset(ACM_lv, subset = assay == "10x 3' v3")
+DefaultAssay(ACM_lv) <- "RNA"
+ACM_lv$sample <- factor(ACM_lv$sample)
+
+# get gene names from row names (ensemble gene IDs) 
+# to match other datasets
+cts <- ACM_lv@assays$RNA@counts
+
+ensembl_hsa <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+gene_names <- biomaRt::getBM(attributes = c("ensembl_gene_id",
+                                            "external_gene_name"),
+                             filters = "ensembl_gene_id",
+                             values = row.names(cts),
+                             ensembl_hsa)
+
+new_names_df <- data.frame(
+  new_names = gene_names$external_gene_name[
+    match(row.names(cts), gene_names$ensembl_gene_id)
+  ],
+  GENEIDS = row.names(cts)
+)
+
+rio::export(new_names_df, "data/output/FB_ACM_DCM_Reichart.LV.gene_names.csv")
+new_names_df <- rio::import("data/output/FB_ACM_DCM_Reichart.LV.gene_names.csv")
+
+keep_old <- which(is.na(new_names_df$new_names) | new_names_df$new_names == "")
+new_names_df$new_names[keep_old] <- row.names(cts)[keep_old]
+
+row.names(cts) <- new_names_df$new_names
+
+# re-create Seurat object
+ACM_lv <- CreateSeuratObject(cts, 
+                             project = "SeuratProject", 
+                             assay = "RNA",
+                             meta.data = ACM_lv@meta.data)
+rm(cts)
+gc()
+
+# harmonize labels
+ACM_lv@meta.data <- ACM_lv@meta.data %>% 
+  mutate(region = Region_x,
+         disease.long = disease,
+         major_labl = Primary.Genetic.Diagnosis)
+
+levels(ACM_lv$disease) <- c("ACM","DCM","NCM","CTRL")
+
+DefaultAssay(FB_A) <- "RNA"
+DefaultAssay(ACM_lv) <- "RNA"
+
+FB_A_V <- merge(FB_A, ACM_lv)
+```
+
+
+# HCM + ACM + H.Atlas + LAA 
+## build matrix and save
+
+```{r}
+DCM_FB <- readRDS("data/output/human_dcm_hcm_scportal_03.17.2022_FB.RDS")
+
+## rename vars
+DCM_FB@meta.data <- DCM_FB@meta.data %>% 
+  mutate(sample = biosample_id,
+         region = "LV",
+         major_labl = disease)
+DCM_FB[["SCT"]] <- NULL
+DCM_FB[["cellranger_raw"]] <- NULL # RNA assay = CellBender-adjusted counts
+
+# remove doublets and MT high
+markers <- presto:::wilcoxauc.Seurat(X = DCM_FB,
+                                     group_by = 'seurat_clusters',
+                                     assay = 'data',
+                                     seurat_assay = 'RNA')
+
+markers_filter <- markers %>% 
+  dplyr::filter(group %in% c(10,12,14) & auc > 0.7)
+
+
+# cluster 10 is mt high, clusters 12 & 14 are CM doublets (RYR2 + TTN high)
+DCM_FB <- subset(DCM_FB, 
+                 subset = seurat_clusters %in% c(10,12,14),
+                 invert = TRUE)
+
+# merging with other FB
+FB_A_V <- merge(FB_A_V, DCM_FB)
+FB_A_V$percent.mt <- PercentageFeatureSet(FB_A_V, pattern = "^MT-")
+
+FB_A_V@meta.data <- FB_A_V@meta.data %>%
+  mutate(dataset = case_when(
+    grepl("^LV_", sample) ~ "HCM",
+    grepl("BS_|BO_|IC_|ED_", sample) ~ "ACM",
+    grepl("^H00", sample) ~ "H.atlas",
+    sample %in% c("CF102", 
+                  "CF69", 
+                  "CF77", 
+                  "CF89", 
+                  "CF91", 
+                  "CF93", 
+                  "CF97") ~ "LAA",
+    TRUE ~ NA
+  ))
+
+
+# save and restart for memory
+saveRDS(FB_A_V@assays$RNA@counts,
+        "data/output/FB_LAA_H.atlas_HCM_ACM.counts_mat.rds") 
+
+keep <- c("sample",
+          "sex",
+          "dataset",
+          "percent.mt",
+          "nCount_RNA",
+          "nFeature_RNA")
+
+saveRDS(FB_A_V@meta.data[, keep],
+        "data/output/FB_LAA_H.atlas_HCM_ACM.meta.rds")
+```
+
+## clustering
+
+```{r}
+# build seurat
+cts <- readRDS("data/output/FB_LAA_H.atlas_HCM_ACM.counts_mat.rds") 
+meta_data <- readRDS("data/output/FB_LAA_H.atlas_HCM_ACM.meta.rds") 
+
+FB_A_V <- CreateSeuratObject(cts, 
+                             project = "SeuratProject", 
+                             assay = "RNA",
+                             meta.data = meta_data)
+rm(cts, meta_data)
+gc()
+
+# process + save
+FB_A_V <- process_seurat(FB_A_V, 
+                         n_dims = 10,
+                         harmony_vars = c("sample"), 
+                         vars.regress = c("percent.mt"))
+
+DefaultAssay(FB_A_V) <- "RNA"
+FB_A_V <- NormalizeData(FB_A_V)
+
+saveRDS(FB_A_V, "data/output/FB_LAA_H.atlas_HCM_ACM_Seurat.rds")
+```
+
+## plot FB atlas sub-FB UMAP and overlap with LAA sub-FB 
+
+```{r}
+# LAA annotation vs cFB atlas
+FB <- readRDS("data/output/FB_scAF.rds") 
+FB <- RenameIdents(FB, '0' = "aFB1", '1' = "aFB2", '2' = "aFB3") 
+FB$FB.states <- as.character(Idents(FB))
+
+
+FB_A_V$FB.states.LAA <- ifelse(colnames(FB_A_V) == colnames(FB), 
+                               FB$FB.states,
+                               NA)
+
+DefaultAssay(FB_A_V) <- "SCT"
+FB_A_V <- FindClusters(FB_A_V, verbose = FALSE, resolution = 0.1)
+FB_A_V <- RenameIdents(FB_A_V,
+                       "0" = "ACSM1+",
+                       "1" = "KAZN+",
+                       "2" = "POSTN+",
+                       "3" = "PCOLCE2+",
+                       "4" = "SERPINE1+",
+                       "5" = "NAMPT+",
+                       "6" = "TNC+",
+                       "7" = "Not.specic")
+
+FB_A_V$sub_FBs <- Idents(FB_A_V)
+
+DimPlot(FB_A_V, label = T, raster = FALSE) +
+  NoAxes() + 
+  NoLegend() +
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.25, top = 0.23)
+
+ggsave("figs/FB_atlas_map/UMAP_sub_FB_LAA_ACM_HCM_Hatlas.png", 
+       width = 4, 
+       height = 4)
+
+# barplot of concordance of sub-FB in our scAF dataset and the FB atlas
+table(FB_A_V$FB.states.LAA, FB_A_V$sub_FBs) %>%
+  t() %>%
+  as.data.frame() %>%
+  ggplot(aes(x = Var2, y = Freq, fill = Var1)) +
+  geom_col(position = "fill") +
+  labs(fill = "Multi-study FB states") +
+  ylab("FB state fractions") + 
+  xlab("scAF FB states") +
+  coord_flip()
+
+ggsave("figs/FB_atlas_map/barplot_FB_states.png", width = 6, height = 3)
+```
+
+## plot aFB3 position on cross-dataset integrated UMAP
+
+```{r}
+FB_A_V$is.aFB3 <- ifelse(FB_A_V$FB.states.LAA == "aFB3", "aFB3", NA)
+FB_A_V$is.aFB3[is.na(FB_A_V$is.aFB3)] <- "other"
+
+DimPlot(FB_A_V, 
+        group.by = "is.aFB3", 
+        raster = FALSE, 
+        cols = c("#CCCCCC20","darkred"), 
+        order = "aFB3") + 
+  ggtitle(NULL) + 
+  NoAxes() + 
+  inset_element(p_umap, left = -0.05, bottom = -0.05, right = 0.25, top = 0.25)
+
+ggsave("figs/FB_atlas_map/aFB3_UMAP.png", width = 5, height = 4)
+```
+
+## save reductions and meta.data
+
+```{r}
+FB_A_V@meta.data[, c("sample",
+                     "sex",
+                     "dataset",
+                     "FB.states.LAA",
+                     "sub_FBs")] %>% 
+  saveRDS("data/output/FB_atlas_meta_data.rds")
+
+FB_A_V@reductions %>% 
+  saveRDS("data/output/FB_atlas_reductions.rds")
+```
+

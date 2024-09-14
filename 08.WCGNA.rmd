@@ -1,0 +1,352 @@
+---
+title: "Bulk_WCGNA"
+author: "Francis Leblanc"
+date: "2023-03-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(rio)
+library(cowplot)
+library(Signac)
+library(patchwork)
+library(WGCNA)
+library(enrichR)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+
+theme_set(theme_cowplot())
+```
+
+# WCGNA on meta-analysis
+
+## data import
+
+```{r}
+meta_DEG <- readRDS("data/output/CTSN_J.Hsu_meta-analysis_DEG.rds")
+meta_labels <- readRDS("data/output/CTSN_J.Hsu_coldata.rds")
+
+meta_DEG_keep <- meta_DEG %>% 
+  filter(baseMean > 1 & pvalue < 0.05 & abs(log2FoldChange) > 0.05) %>% 
+  pull(gene_name)
+
+expr <- readRDS("data/output/CTSN_J.Hsu_expr.rds")
+input_mat <- t(expr[meta_DEG_keep, ])
+
+scAF <- readRDS("data/output/scAF_peaks2.rds")
+DefaultAssay(scAF) <- "RNA"
+```
+
+## testing power
+
+```{r}
+allowWGCNAThreads(nThreads = 6) 
+
+powers <- c(c(1:10), seq(from = 12, to = 20, by = 2))
+
+sft <- pickSoftThreshold(input_mat,
+                         blockSize = 20000,
+                         powerVector = powers,
+                         verbose = 5)
+
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     main = paste("Scale independence"))
+
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, 
+     cex = cex1, 
+     col = "red")
+
+abline(h = 0.90, col = "red")
+
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     type = "n",
+     main = paste("Mean connectivity"))
+
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers,
+     cex = cex1, col = "red")
+```
+
+# WGCNA pathways
+7970 genes, power is 9
+
+```{r}
+temp_cor <- cor       
+cor <- WGCNA::cor # avoids error      
+netwk <- blockwiseModules(input_mat,
+                          loadTOM = T,
+                          power = 9,
+                          networkType = "signed",
+                          pamRespectsDendro = F,
+                          minModuleSize = 50,
+                          maxBlockSize = 20000,
+                          reassignThreshold = 0,
+                          mergeCutHeight = 0.25,
+                          saveTOMs = T,
+                          saveTOMFileBase = "data/output/bulk.WCGNA.TOM_0.05/",
+                          numericLabels = T,
+                          verbose = 3)
+cor <- temp_cor # Return cor function to original namespace
+mergedcolors <- labels2colors(netwk$colors) 
+
+# plot dendrogram 
+png("figs/WGCNA/dendrogramn.png",
+    width = 8,
+    height = 4,
+    units = "in",
+    res = 300)
+
+plotDendroAndColors(netwk$dendrograms[[1]],
+                    mergedcolors[netwk$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE,
+                    hang = 0.03,
+                    addGuide = F,
+                    guideHang = 0.05)
+
+dev.off()
+```
+
+# Fig WCGNA
+## Label gene markers for each celltype
+
+```{r}
+# Create module DF
+module_df <- data.frame(
+  gene_id = names(netwk$colors),
+  colors = labels2colors(netwk$colors)
+) %>% 
+  mutate(L2FC = meta_DEG$log2FoldChange[match(gene_id, meta_DEG$gene_name)],
+         padj = meta_DEG$padj[match(gene_id, meta_DEG$gene_name)])
+
+# color by cell-type markers
+markers <- presto::wilcoxauc(scAF, "WNN.sub.ct") %>% 
+  dplyr::filter(feature %in% module_df$gene_id & auc > 0.6)
+
+rmv <- markers$feature[duplicated(markers$feature)]
+
+markers <- dplyr::filter(markers, !feature %in% rmv)
+
+module_df$cell_type.marker <-
+  markers$group[match(module_df$gene_id, markers$feature)]
+
+rio::export(module_df, "results/WGCNA_modules_genes.csv")
+```
+
+## compute pathways enrichment 
+
+```{r}
+pw.names <- c("GO_BP", "PanglaoDB")
+pw.db <- c("GO_Biological_Process_2021", "PanglaoDB_Augmented_2021")
+modules <- unique(module_df$colors)
+modules <- modules[modules != "grey"]
+
+l.res <- lapply(1:length(modules), function(x){
+  ranked.genes <- module_df %>% 
+    dplyr::filter(module_df$colors == modules[x] & padj < 0.05) %>% 
+    pull(gene_id)
+  
+  Sys.sleep(2)
+  enriched <- enrichr(ranked.genes, c("GO_Biological_Process_2021",
+                                      "PanglaoDB_Augmented_2021"))
+  for (db in 1:length(enriched)) {
+    if (nrow(enriched[[db]]) > 0) {
+      enriched[[db]]$database <- pw.names[db]
+      enriched[[db]]$module <- modules[x]
+      }
+  }
+  
+  enriched <- do.call(rbind, enriched)
+  enriched$overlap.n <- str_split(enriched$Overlap, "[/]", simplify = T)[,1] %>% 
+    as.numeric()
+  enriched <- dplyr::filter(enriched, overlap.n > 2)
+  enriched
+})
+
+res <- do.call(rbind, l.res)
+rio::export(res, "results/WCGNA_pathways.csv")
+```
+
+## plot top pathways by module
+
+```{r}
+# number of DEG per modules
+module_df <- module_df %>%
+  mutate(DEG = ifelse(padj < 0.05 & L2FC > 0, "up", "NS")) %>%
+  mutate(DEG = ifelse(padj < 0.05 & L2FC < 0, "down", DEG)) %>%
+  mutate(DEG = factor(DEG, levels = c("up", "down", "NS")))
+
+# keep top pathways per modules 
+res_top <- res %>%
+  dplyr::filter(Adjusted.P.value < 0.1 & overlap.n > 2) %>%
+  arrange(Combined.Score) %>%
+  dplyr::group_by(module, database) %>%
+  slice_min(Adjusted.P.value, n = 3) %>% 
+  slice_max(Combined.Score, n = 3)
+
+# order modules
+mod_lev <- module_df %>% 
+  dplyr::filter(padj < 0.05 & colors != "grey" & colors %in% res_top$module) %>% 
+  group_by(colors) %>% 
+  summarise(mean.l2fc = mean(L2FC)) %>% 
+  arrange(mean.l2fc) %>% 
+  mutate(colors = factor(colors, levels = colors)) %>% 
+  pull(colors) %>% 
+  as.character() 
+
+res_top <- res_top %>% 
+  mutate(module = factor(module, levels = mod_lev),
+         Term = str_split(Term, fixed("(GO"), simplify = T)[,1]) %>% 
+  arrange(Adjusted.P.value) %>% 
+  mutate(Term = factor(Term))
+
+# plot pathways
+p <- ggplot(res_top, aes(y = Term,
+                         x = -log10(Adjusted.P.value),
+                         fill = database)) +
+  geom_point(shape = 21, aes(size = overlap.n)) + 
+  ylab(NULL) + 
+  theme(legend.title = element_text(size = 11),
+        legend.key.size = unit(0.2, 'in'),
+        legend.text = element_text(size = 11),
+        legend.position = c(-3, 0.96))
+
+p <- ggpubr::facet(p,
+                   facet.by = c("module"),
+                   ncol = 1,
+                   scales = "free_y",
+                   panel.labs.background = list(color = "transparent", 
+                                                fill = "transparent")) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank()) +
+  scale_fill_manual(values = c("black", "white"))
+```
+
+## plot DEG by module
+
+```{r}
+#  Volcano plots of bulk AF DEG by modules
+top_module_df <- module_df %>% 
+  dplyr::filter(colors %in% res_top$module) %>% 
+  mutate(colors = factor(colors, levels = mod_lev)) 
+
+DEG_counts <- lapply(mod_lev, function(x){
+  top_module_df %>% 
+    dplyr::filter(colors == x) %>% 
+    pull(DEG) %>% 
+    table()
+}) %>% 
+  do.call(rbind,.) %>% 
+  as.data.frame()
+
+DEG_counts$colors <- factor(mod_lev, levels = mod_lev)
+
+p.v <- ggplot(top_module_df, aes(L2FC,-log10(padj), color = colors)) +
+  geom_point(color = top_module_df$colors, size = 0.5) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed")
+
+p.v <- ggpubr::facet(p.v,
+                     facet.by = "colors",
+                     ncol = 1,
+                     panel.labs.background = list(color = "transparent",
+                                                  fill = "transparent")) +
+  geom_text(data = DEG_counts,
+            aes(x = 1, y = 30, label = up),
+            color = "darkred") +
+  geom_text(data = DEG_counts,
+            aes(x = -1, y = 30, label = down),
+            color = "blue")
+```
+
+# plot module scores by cell-type
+
+```{r}
+#  compute module scores
+l_mod <- lapply(unique(module_df$colors), function(x) {
+  module_df %>%
+    dplyr::filter(colors == x & padj < 0.05) %>%
+    pull(gene_id)
+})
+names(l_mod) <- unique(module_df$colors)
+
+scAF <- AddModuleScore(scAF, features = l_mod)
+colnames(scAF@meta.data)[
+  (ncol(scAF@meta.data)-length(l_mod)+1):ncol(scAF@meta.data)
+  ] <- names(l_mod)
+
+scAF$WNN.sub.ct <- factor(scAF$WNN.sub.ct, levels = c('CM',
+                                                      'Lymphoid',
+                                                      'Mast',
+                                                      'Myeloid',
+                                                      'PC',
+                                                      'SMC',
+                                                      'Mesothelial',
+                                                      'EC',
+                                                      'Endocardial',
+                                                      'FB',
+                                                      'Adipo',
+                                                      'Neuron'))
+
+# plot scores as violin plots by celltype
+l.p <- lapply(mod_lev, function(x){
+  if (x == mod_lev[length(mod_lev)]) {
+    VlnPlot(scAF, x, group.by = "WNN.sub.ct", pt.size = 0) +
+      xlab(NULL) + 
+      ggtitle(NULL)
+    }
+  else{
+    VlnPlot(scAF, x, group.by = "WNN.sub.ct", sort = F, pt.size = 0) + 
+      xlab(NULL) + 
+      ggtitle(NULL) + 
+      theme(axis.text.x = element_blank())
+    }
+})
+names(l.p) <- mod_lev
+patch2 <- wrap_plots(l.p, ncol = 1) & NoLegend() 
+
+# combine plots
+p + p.v + patch2 + plot_layout(ncol = 3, widths = c(1,1,1.5))
+ggsave("figs/WGCNA/pathways_PanglaoDB_GO.BP.png", width = 15, height = 15)
+```
+
+
+## Heatmaps of mean scores by cell-type
+
+```{r}
+m <- lapply(names(l_mod), function(x){
+  scAF@meta.data %>% 
+    dplyr::group_by(WNN.sub.ct) %>% 
+    summarise(mean.x = mean(get(x))) %>% 
+    pull(mean.x)
+}) %>% 
+  do.call(rbind, .)
+
+row.names(m) <- names(l_mod)
+colnames(m) <- levels(scAF@meta.data$WNN.sub.ct)
+png("figs/WGCNA/heatmap_CT_modules_mean.png",
+    width = 6,
+    height = 4, 
+    units = "in", 
+    res = 300)
+set.seed(2022)
+ComplexHeatmap::Heatmap(scale(t(m)), 
+                        name = "Scaled\nscores", 
+                        column_names_rot = 45)
+dev.off()
+```
