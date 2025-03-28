@@ -3,7 +3,7 @@
 ## Abstract
 The dysregulation of gene expression programs in the human atria during persistent atrial fibrillation (AF) is not completely understood. Here, we reanalyze bulk RNA-sequencing datasets from two studies (N = 242) and identified 755 differentially expressed genes in left atrial appendages of individuals with persistent AF and non-AF controls. We combined the bulk RNA-sequencing differentially expressed genes with a left atrial appendage single-nucleus multi-omics dataset to assign genes to specific atrial cell types. We found noncoding genes at the IFNG locus (LINC01479, IFNG-AS1) strongly dysregulated in cardiomyocytes. We defined a gene expression signature potentially driven by androgen receptor signaling in cardiomyocytes from individuals with AF. Cell-type-specific gene expression modules suggested an increase in T cell and a decrease in adipocyte and neuronal cell gene expression in AF. Lastly, we showed that reducing NR4A1 expression, a marker of a poorly characterized human atrial fibroblast subtype, fibroblast activation markers, extracellular matrix remodeling and cell proliferation decreased.
 
-
+![AF Single-nucleus multiome Fig.1](figs/AF_multiome_fig1.webp)
 
 
 ## Paper Reference
